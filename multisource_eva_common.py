@@ -71,7 +71,7 @@ def _serialize_kan_model(model) -> dict:
             "sb_trainable": bool(model.sb_trainable),
             "seed": int(getattr(model, "seed", 1)),
             "save_act": bool(model.save_act),
-            "sparse_init": bool(model.sparse_init),
+            "sparse_init": bool(getattr(model, "sparse_init", False)),
         },
     }
 
@@ -92,7 +92,7 @@ def _deserialize_kan_model(payload: dict, device: str):
         sb_trainable=config["sb_trainable"],
         seed=config["seed"],
         save_act=config["save_act"],
-        sparse_init=config["sparse_init"],
+        sparse_init=config.get("sparse_init", False),
         auto_save=False,
         device=device,
     ).to(device)
