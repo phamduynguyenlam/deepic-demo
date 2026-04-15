@@ -537,10 +537,10 @@ def run_comparison(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train HV_DeepIC on ZDT1 and compare against NSGA-EIC.")
-    parser.add_argument("--archive_size", type=int, default=100)
+    parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
     parser.add_argument("--k_eval", type=int, default=5)
-    parser.add_argument("--max_fe", type=int, default=200)
+    parser.add_argument("--max_fe", type=int, default=160)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
     parser.add_argument("--kan_hidden", type=int, default=10)
