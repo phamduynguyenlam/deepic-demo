@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 
 import demo
+from problem.kan import KAN
 
 
 def load_module(filename: str, module_name: str):
@@ -15,6 +16,28 @@ def load_module(filename: str, module_name: str):
 
 
 nda = load_module("nsga-nda.py", "nsga_nda_module")
+
+
+def serialize_kan_model(model) -> dict:
+    return {
+        "state_dict": model.state_dict(),
+        "config": {
+            "width": list(model.width),
+            "grid": int(model.grid),
+            "k": int(model.k),
+            "mult_arity": model.mult_arity,
+            "base_fun": model.base_fun_name,
+            "symbolic_enabled": bool(model.symbolic_enabled),
+            "affine_trainable": bool(model.affine_trainable),
+            "grid_eps": float(model.grid_eps),
+            "grid_range": list(model.grid_range),
+            "sp_trainable": bool(model.sp_trainable),
+            "sb_trainable": bool(model.sb_trainable),
+            "seed": int(getattr(model, "seed", 1)),
+            "save_act": bool(model.save_act),
+            "sparse_init": bool(model.sparse_init),
+        },
+    }
 
 
 def pretrain_and_save_kan_surrogates(args):
@@ -37,7 +60,7 @@ def pretrain_and_save_kan_surrogates(args):
             # Save the models
             save_path = Path(__file__).resolve().parent / f"kan_{problem_name.lower()}_{dim}d.pth"
             demo.torch.save({
-                'models': models,
+                'models': [serialize_kan_model(model) for model in models],
                 'x_data': x_data,
                 'y_data': y_data,
                 'problem_name': problem_name,

@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import demo
+from problem.kan import KAN
 
 
 def load_module(filename: str, module_name: str):
@@ -51,6 +52,52 @@ def _move_models_to_device(models, device: str):
         if hasattr(model, "device"):
             model.device = device
     return models
+
+
+def _serialize_kan_model(model) -> dict:
+    return {
+        "state_dict": model.state_dict(),
+        "config": {
+            "width": list(model.width),
+            "grid": int(model.grid),
+            "k": int(model.k),
+            "mult_arity": model.mult_arity,
+            "base_fun": model.base_fun_name,
+            "symbolic_enabled": bool(model.symbolic_enabled),
+            "affine_trainable": bool(model.affine_trainable),
+            "grid_eps": float(model.grid_eps),
+            "grid_range": list(model.grid_range),
+            "sp_trainable": bool(model.sp_trainable),
+            "sb_trainable": bool(model.sb_trainable),
+            "seed": int(getattr(model, "seed", 1)),
+            "save_act": bool(model.save_act),
+            "sparse_init": bool(model.sparse_init),
+        },
+    }
+
+
+def _deserialize_kan_model(payload: dict, device: str):
+    config = dict(payload["config"])
+    model = KAN(
+        width=config["width"],
+        grid=config["grid"],
+        k=config["k"],
+        mult_arity=config["mult_arity"],
+        base_fun=config["base_fun"],
+        symbolic_enabled=config["symbolic_enabled"],
+        affine_trainable=config["affine_trainable"],
+        grid_eps=config["grid_eps"],
+        grid_range=config["grid_range"],
+        sp_trainable=config["sp_trainable"],
+        sb_trainable=config["sb_trainable"],
+        seed=config["seed"],
+        save_act=config["save_act"],
+        sparse_init=config["sparse_init"],
+        auto_save=False,
+        device=device,
+    ).to(device)
+    model.load_state_dict(payload["state_dict"])
+    return model
 
 
 def _stable_seed(base_seed: int, problem_name: str, dim: int) -> int:
@@ -121,11 +168,16 @@ def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
         if not isinstance(payload, dict) or "models" not in payload or "x_data" not in payload or "y_data" not in payload:
             raise ValueError(f"Invalid KAN checkpoint format: {save_path}")
         print(f"Loaded stored KAN surrogate from {save_path.name}")
+        stored_models = payload["models"]
+        if stored_models and isinstance(stored_models[0], dict) and "state_dict" in stored_models[0]:
+            models = [_deserialize_kan_model(item, args.device) for item in stored_models]
+        else:
+            models = _move_models_to_device(stored_models, args.device)
         return {
             "problem": nda.ZDTProblem(name=problem_name, dim=dim),
             "x": np.asarray(payload["x_data"], dtype=np.float32),
             "y": np.asarray(payload["y_data"], dtype=np.float32),
-            "models": _move_models_to_device(payload["models"], args.device),
+            "models": models,
         }
 
     print(f"Stored KAN surrogate not found for {problem_name}-{dim}D. Pre-training and saving it now...")
@@ -141,7 +193,7 @@ def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
     models = _move_models_to_device(models, args.device)
     demo.torch.save(
         {
-            "models": models,
+            "models": [_serialize_kan_model(model) for model in models],
             "x_data": x_data,
             "y_data": y_data,
             "problem_name": problem_name,
@@ -581,4 +633,3 @@ def main_for_problem(target_problem: str):
         train_deepic_multisource(args, target_problem)
     else:
         run_comparison(args, target_problem)
-
