@@ -104,22 +104,33 @@ def pretrain_source_surrogates(args):
     cache = {}
     for dim in SOURCE_DIMS:
         for problem_name in SOURCE_PROBLEMS:
-            print(f"Pre-training KAN surrogate on {problem_name}-{dim}D...")
-            problem = nda.ZDTProblem(name=problem_name, dim=dim)
-            x_data, y_data, models = nda.pre_train_kan_surrogate_for_problem(
-                problem=problem,
-                device=args.device,
-                kan_steps=args.kan_steps,
-                hidden_width=args.kan_hidden,
-                grid=args.kan_grid,
-                seed=args.seed + dim,
-            )
-            cache[(problem_name, dim)] = {
-                "problem": problem,
-                "x": x_data,
-                "y": y_data,
-                "models": models,
-            }
+            path = Path(__file__).resolve().parent / f"kan_{problem_name.lower()}_{dim}d.pth"
+            if path.exists():
+                print(f"Loading pre-trained KAN surrogate from {path}")
+                checkpoint = demo.torch.load(path, map_location=args.device)
+                cache[(problem_name, dim)] = {
+                    "problem": nda.ZDTProblem(name=problem_name, dim=dim),
+                    "x": checkpoint['x_data'],
+                    "y": checkpoint['y_data'],
+                    "models": checkpoint['models'],
+                }
+            else:
+                print(f"Pre-training KAN surrogate on {problem_name}-{dim}D...")
+                problem = nda.ZDTProblem(name=problem_name, dim=dim)
+                x_data, y_data, models = nda.pre_train_kan_surrogate_for_problem(
+                    problem=problem,
+                    device=args.device,
+                    kan_steps=args.kan_steps,
+                    hidden_width=args.kan_hidden,
+                    grid=args.kan_grid,
+                    seed=args.seed + dim,
+                )
+                cache[(problem_name, dim)] = {
+                    "problem": problem,
+                    "x": x_data,
+                    "y": y_data,
+                    "models": models,
+                }
     return cache
 
 
@@ -307,14 +318,21 @@ def run_saea_deepic_zdt1(args, deepic, plot: bool = True, initial_archive_x: np.
     problem = nda.ZDTProblem(name="ZDT1", dim=args.dim)
     ref_point = np.array([0.9994, 6.0576], dtype=np.float32)
 
-    pretrain_x, pretrain_y, surrogates = nda.pre_train_kan_surrogate_for_problem(
-        problem=problem,
-        device=args.device,
-        kan_steps=args.kan_steps,
-        hidden_width=args.kan_hidden,
-        grid=args.kan_grid,
-        seed=args.seed,
-    )
+    path = Path(__file__).resolve().parent / f"kan_zdt1_{args.dim}d.pth"
+    if path.exists():
+        print(f"Loading pre-trained KAN surrogate for ZDT1-{args.dim}D from {path}")
+        checkpoint = demo.torch.load(path, map_location=args.device)
+        pretrain_x, pretrain_y, surrogates = checkpoint['x_data'], checkpoint['y_data'], checkpoint['models']
+    else:
+        print(f"Pre-training KAN surrogate for ZDT1-{args.dim}D...")
+        pretrain_x, pretrain_y, surrogates = nda.pre_train_kan_surrogate_for_problem(
+            problem=problem,
+            device=args.device,
+            kan_steps=args.kan_steps,
+            hidden_width=args.kan_hidden,
+            grid=args.kan_grid,
+            seed=args.seed,
+        )
     print(f"Pre-trained KAN surrogate on ZDT1-{args.dim}D with {pretrain_x.shape[0]} samples.")
 
     if initial_archive_x is None:
