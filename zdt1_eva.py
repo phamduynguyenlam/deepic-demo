@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import demo
+from problem.kan import KAN
 
 
 def load_module(filename: str, module_name: str):
@@ -32,6 +33,18 @@ ZDT1_EVA_REWARD_LOG_PATH = REWARD_LOG_DIR / "zdt1_eva_train_rewards.json"
 def _save_reward_log(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def deserialize_kan_model(checkpoint: dict, device: str):
+    if hasattr(checkpoint, "load_state_dict"):
+        return checkpoint
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint or "config" not in checkpoint:
+        raise ValueError("Unsupported KAN model checkpoint format")
+    config = checkpoint["config"].copy()
+    config["device"] = device
+    model = KAN(**config).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+    return model
 
 
 def build_args_namespace(parsed) -> SimpleNamespace:
@@ -112,7 +125,7 @@ def pretrain_source_surrogates(args):
                     "problem": nda.ZDTProblem(name=problem_name, dim=dim),
                     "x": checkpoint['x_data'],
                     "y": checkpoint['y_data'],
-                    "models": checkpoint['models'],
+                    "models": [deserialize_kan_model(model_checkpoint, args.device) for model_checkpoint in checkpoint['models']],
                 }
             else:
                 print(f"Pre-training KAN surrogate on {problem_name}-{dim}D...")
@@ -322,7 +335,9 @@ def run_saea_deepic_zdt1(args, deepic, plot: bool = True, initial_archive_x: np.
     if path.exists():
         print(f"Loading pre-trained KAN surrogate for ZDT1-{args.dim}D from {path}")
         checkpoint = demo.torch.load(path, map_location=args.device, weights_only=False)
-        pretrain_x, pretrain_y, surrogates = checkpoint['x_data'], checkpoint['y_data'], checkpoint['models']
+        pretrain_x = checkpoint['x_data']
+        pretrain_y = checkpoint['y_data']
+        surrogates = [deserialize_kan_model(model_checkpoint, args.device) for model_checkpoint in checkpoint['models']]
     else:
         print(f"Pre-training KAN surrogate for ZDT1-{args.dim}D...")
         pretrain_x, pretrain_y, surrogates = nda.pre_train_kan_surrogate_for_problem(
