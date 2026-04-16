@@ -373,7 +373,14 @@ def train_deepic_multisource(args, target_problem: str):
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(target_problem, epoch + 1))
 
-    demo.torch.save(deepic.state_dict(), model_path)
+        # Chèn đoạn này vào vị trí thích hợp trong vòng lặp epoch
+        if (epoch + 1) % 10 == 0:
+            save_path = f"/content/drive/MyDrive/DeepIC_Models/kan_surrogate_epoch_{epoch+1}.pth"
+            import torch
+            torch.save(deepic.state_dict(), save_path) # (Lưu ý: Thay chữ 'model' bằng tên biến mô hình trong code thực tế)
+            print(f"Đã lưu checkpoint vào Drive: {save_path}")
+        
+            demo.torch.save(deepic.state_dict(), model_path)
     print(f"DeepIC model saved to {model_path.name}")
     _save_reward_log(
         reward_log_path,
