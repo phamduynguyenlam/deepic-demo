@@ -7,6 +7,7 @@ import numpy as np
 
 import demo
 import hv_deepic_zdt1 as hv_zdt1
+import multisource_eva_common as multisource
 
 
 def load_hv_deepic2_class():
@@ -115,18 +116,13 @@ def _torch_load(path: Path | str, map_location: str):
 
 def train_hv_deepic2_zdt1(args):
     demo.set_seed(args.seed)
-    problem = hv_zdt1.nda.ZDTProblem(name=PROBLEM_NAME, dim=args.dim)
-
-    print("Pre-training KAN surrogate on ZDT1...")
-    pretrain_x, pretrain_y, surrogates = hv_zdt1.nda.pre_train_kan_surrogate_for_problem(
-        problem=problem,
-        device=args.device,
-        kan_steps=args.kan_steps,
-        hidden_width=args.kan_hidden,
-        grid=args.kan_grid,
-        seed=args.seed,
+    pretrain_cache = multisource.pretrain_source_surrogates(args, PROBLEM_NAME)
+    source_problems = multisource.source_problems_for(PROBLEM_NAME)
+    source_dims = multisource.SOURCE_DIMS
+    print(
+        "Prepared mixed-source KAN surrogates for "
+        f"{len(source_problems)} problems across dims {source_dims}."
     )
-    print("Pre-training completed.")
 
     replay = demo.ReplayBuffer(capacity=256)
     deepic = HVDeepIC2Class(
@@ -147,126 +143,135 @@ def train_hv_deepic2_zdt1(args):
             print(f"Checkpoint {checkpoint_path.name} not found, starting from scratch")
 
     for epoch in range(args.start_epoch, 50):
-        print(f"HV_DeepIC2 ZDT1 Epoch {epoch + 1}/50")
+        print(f"HV_DeepIC2 source-mix epoch {epoch + 1}/50")
 
-        archive_x = hv_zdt1.latin_hypercube_sample(
-            lower=problem.lower,
-            upper=problem.upper,
-            n_samples=args.archive_size,
-            dim=args.dim,
-            seed=args.seed + epoch,
-        )
-        archive_y = problem.evaluate(archive_x)
-        true_evals = args.archive_size
-        steps_to_run = (args.max_fe - true_evals) // args.k_eval
+        for dim in source_dims:
+            for problem_name in source_problems:
+                entry = pretrain_cache[(problem_name, dim)]
+                problem = entry["problem"]
+                pretrain_x = entry["x"]
+                pretrain_y = entry["y"]
+                surrogates = entry["models"]
+                ref_point = multisource.nsga_eic._reference_point(problem_name, dim)
 
-        for step in range(steps_to_run):
-            offspring_x, offspring_pred = hv_zdt1.generate_nsga2_pseudo_front(
-                archive_x=archive_x,
-                problem=problem,
-                surrogates=surrogates,
-                device=args.device,
-                n_offspring=args.offspring_size,
-                sigma=args.mutation_sigma,
-                surrogate_nsga_steps=args.surrogate_nsga_steps,
-            )
-            archive_pred = demo.predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-            offspring_sigma = demo.estimate_uncertainty(
-                archive_x=archive_x,
-                archive_y=archive_y,
-                archive_pred=archive_pred,
-                offspring_x=offspring_x,
-            ).astype(np.float32)
+                archive_x = multisource.latin_hypercube_sample(
+                    lower=problem.lower,
+                    upper=problem.upper,
+                    n_samples=args.archive_size,
+                    dim=dim,
+                    seed=args.seed + epoch * 10000 + multisource._stable_seed(0, problem_name, dim),
+                )
+                archive_y = problem.evaluate(archive_x)
+                true_evals = args.archive_size
+                steps_to_run = (args.max_fe - true_evals) // args.k_eval
 
-            progress = float(true_evals / args.max_fe)
-            ranking = demo.infer_deepic_ranking(
-                model=deepic,
-                archive_x=archive_x,
-                archive_y=archive_y,
-                offspring_x=offspring_x,
-                offspring_pred=offspring_pred,
-                offspring_sigma=offspring_sigma,
-                lower=problem.lower,
-                upper=problem.upper,
-                progress=progress,
-                device=args.device,
-            )
-
-            selected_idx = ranking[: args.k_eval]
-            selected_x = offspring_x[selected_idx]
-            selected_y = problem.evaluate(selected_x)
-
-            reward = deepic.pareto_improvement_reward(
-                previous_archive=archive_y,
-                selected_objectives=selected_y,
-                ref_point=REFERENCE_POINT,
-                epsilon=args.hv_epsilon,
-            )
-
-            archive_x, archive_y = demo.update_archive(
-                archive_x=archive_x,
-                archive_y=archive_y,
-                new_x=selected_x,
-                new_y=selected_y,
-            )
-
-            replay.add(
-                {
-                    "archive_x": archive_x,
-                    "archive_y": archive_y,
-                    "offspring_x": offspring_x,
-                    "offspring_pred": offspring_pred,
-                    "offspring_sigma": offspring_sigma,
-                    "ranking": ranking,
-                    "reward": reward,
-                    "progress": progress,
-                    "lower": problem.lower,
-                    "upper": problem.upper,
-                }
-            )
-
-            if len(replay) >= 32:
-                for sample in replay.sample(32):
-                    demo.adapt_deepic(
-                        model=deepic,
-                        optimizer=deepic_optimizer,
-                        archive_x=sample["archive_x"],
-                        archive_y=sample["archive_y"],
-                        offspring_x=sample["offspring_x"],
-                        offspring_pred=sample["offspring_pred"],
-                        offspring_sigma=sample["offspring_sigma"],
-                        lower=sample["lower"],
-                        upper=sample["upper"],
-                        progress=sample["progress"],
-                        target_ranking=sample["ranking"],
-                        reward=None,
+                for step in range(steps_to_run):
+                    offspring_x, offspring_pred = hv_zdt1.generate_nsga2_pseudo_front(
+                        archive_x=archive_x,
+                        problem=problem,
+                        surrogates=surrogates,
                         device=args.device,
-                        steps=1,
+                        n_offspring=args.offspring_size,
+                        sigma=args.mutation_sigma,
+                        surrogate_nsga_steps=args.surrogate_nsga_steps,
+                    )
+                    archive_pred = demo.predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
+                    offspring_sigma = demo.estimate_uncertainty(
+                        archive_x=archive_x,
+                        archive_y=archive_y,
+                        archive_pred=archive_pred,
+                        offspring_x=offspring_x,
+                    ).astype(np.float32)
+
+                    progress = float(true_evals / args.max_fe)
+                    ranking = demo.infer_deepic_ranking(
+                        model=deepic,
+                        archive_x=archive_x,
+                        archive_y=archive_y,
+                        offspring_x=offspring_x,
+                        offspring_pred=offspring_pred,
+                        offspring_sigma=offspring_sigma,
+                        lower=problem.lower,
+                        upper=problem.upper,
+                        progress=progress,
+                        device=args.device,
                     )
 
-            true_evals += args.k_eval
-            if true_evals >= args.max_fe:
-                break
+                    selected_idx = ranking[: args.k_eval]
+                    selected_x = offspring_x[selected_idx]
+                    selected_y = problem.evaluate(selected_x)
 
-            combined_x = np.vstack([pretrain_x, archive_x])
-            combined_y = np.vstack([pretrain_y, archive_y])
-            surrogates = demo.fit_kan_surrogates(
-                archive_x=combined_x,
-                archive_y=combined_y,
-                device=args.device,
-                kan_steps=args.kan_steps,
-                hidden_width=args.kan_hidden,
-                grid=args.kan_grid,
-                seed=args.seed + epoch * 100 + step,
-            )
+                    reward = deepic.pareto_improvement_reward(
+                        previous_archive=archive_y,
+                        selected_objectives=selected_y,
+                        ref_point=ref_point,
+                        epsilon=args.hv_epsilon,
+                    )
 
-        fronts, _ = demo.fast_non_dominated_sort(archive_y)
-        front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
-        hv_value = demo.hypervolume_2d(front, REFERENCE_POINT)
-        print(
-            f"HV_DeepIC2 epoch {epoch + 1} done, true_evals={true_evals}, "
-            f"front0={front.shape[0]}, hv={hv_value:.6f}, surrogate_nsga_steps={args.surrogate_nsga_steps}"
-        )
+                    archive_x, archive_y = demo.update_archive(
+                        archive_x=archive_x,
+                        archive_y=archive_y,
+                        new_x=selected_x,
+                        new_y=selected_y,
+                    )
+
+                    replay.add(
+                        {
+                            "archive_x": archive_x,
+                            "archive_y": archive_y,
+                            "offspring_x": offspring_x,
+                            "offspring_pred": offspring_pred,
+                            "offspring_sigma": offspring_sigma,
+                            "ranking": ranking,
+                            "reward": reward,
+                            "progress": progress,
+                            "lower": problem.lower,
+                            "upper": problem.upper,
+                        }
+                    )
+
+                    if len(replay) >= 32:
+                        for sample in replay.sample(32):
+                            demo.adapt_deepic(
+                                model=deepic,
+                                optimizer=deepic_optimizer,
+                                archive_x=sample["archive_x"],
+                                archive_y=sample["archive_y"],
+                                offspring_x=sample["offspring_x"],
+                                offspring_pred=sample["offspring_pred"],
+                                offspring_sigma=sample["offspring_sigma"],
+                                lower=sample["lower"],
+                                upper=sample["upper"],
+                                progress=sample["progress"],
+                                target_ranking=sample["ranking"],
+                                reward=None,
+                                device=args.device,
+                                steps=1,
+                            )
+
+                    true_evals += args.k_eval
+                    if true_evals >= args.max_fe:
+                        break
+
+                    combined_x = np.vstack([pretrain_x, archive_x])
+                    combined_y = np.vstack([pretrain_y, archive_y])
+                    surrogates = demo.fit_kan_surrogates(
+                        archive_x=combined_x,
+                        archive_y=combined_y,
+                        device=args.device,
+                        kan_steps=args.kan_steps,
+                        hidden_width=args.kan_hidden,
+                        grid=args.kan_grid,
+                        seed=args.seed + epoch * 10000 + dim * 100 + step,
+                    )
+
+                fronts, _ = demo.fast_non_dominated_sort(archive_y)
+                front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+                hv_value = deepic.hypervolume(front, ref_point)
+                print(
+                    f"{problem_name}-{dim}D epoch {epoch + 1} done, true_evals={true_evals}, "
+                    f"front0={front.shape[0]}, hv={hv_value:.6f}, surrogate_nsga_steps={args.surrogate_nsga_steps}"
+                )
         demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(epoch + 1))
 
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
@@ -494,7 +499,9 @@ def run_comparison(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train HV_DeepIC2 on ZDT1 and compare against NSGA-EIC.")
+    parser = argparse.ArgumentParser(
+        description="Train HV_DeepIC2 on 15D/20D/25D mixed-source problems and evaluate on ZDT1."
+    )
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
     parser.add_argument("--k_eval", type=int, default=5)
@@ -519,7 +526,7 @@ def parse_args():
         default=0,
         help="Start training from this epoch checkpoint number, if it exists.",
     )
-    parser.add_argument("--train_only", action="store_true", help="Only train HV_DeepIC2 on ZDT1.")
+    parser.add_argument("--train_only", action="store_true", help="Only train the mixed-source HV_DeepIC2 model.")
     return parser.parse_args()
 
 
