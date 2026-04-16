@@ -107,7 +107,7 @@ def pretrain_source_surrogates(args):
             path = Path(__file__).resolve().parent / f"kan_{problem_name.lower()}_{dim}d.pth"
             if path.exists():
                 print(f"Loading pre-trained KAN surrogate from {path}")
-                checkpoint = demo.torch.load(path, map_location=args.device)
+                checkpoint = demo.torch.load(path, map_location=args.device, weights_only=False)
                 cache[(problem_name, dim)] = {
                     "problem": nda.ZDTProblem(name=problem_name, dim=dim),
                     "x": checkpoint['x_data'],
@@ -321,7 +321,7 @@ def run_saea_deepic_zdt1(args, deepic, plot: bool = True, initial_archive_x: np.
     path = Path(__file__).resolve().parent / f"kan_zdt1_{args.dim}d.pth"
     if path.exists():
         print(f"Loading pre-trained KAN surrogate for ZDT1-{args.dim}D from {path}")
-        checkpoint = demo.torch.load(path, map_location=args.device)
+        checkpoint = demo.torch.load(path, map_location=args.device, weights_only=False)
         pretrain_x, pretrain_y, surrogates = checkpoint['x_data'], checkpoint['y_data'], checkpoint['models']
     else:
         print(f"Pre-training KAN surrogate for ZDT1-{args.dim}D...")
