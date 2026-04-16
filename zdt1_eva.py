@@ -35,20 +35,52 @@ def _save_reward_log(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def epoch_model_path(epoch: int) -> Path:
-    return Path(__file__).resolve().parent / f"zdt1_model_epoch_{epoch}.pth"
+def epoch_model_path(epoch: int, suffix: str = ".pth") -> Path:
+    return Path(__file__).resolve().parent / f"zdt1_model_epoch_{epoch}{suffix}"
+
+
+def resolve_epoch_model_path(epoch: int) -> Path:
+    preferred = epoch_model_path(epoch, ".pth")
+    legacy = epoch_model_path(epoch, ".py")
+    if preferred.exists():
+        return preferred
+    if legacy.exists():
+        return legacy
+    return preferred
 
 
 def deserialize_kan_model(checkpoint: dict, device: str):
-    if hasattr(checkpoint, "load_state_dict"):
-        return checkpoint
-    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint or "config" not in checkpoint:
-        raise ValueError("Unsupported KAN model checkpoint format")
-    config = checkpoint["config"].copy()
-    config["device"] = device
-    model = KAN(**config).to(device)
-    model.load_state_dict(checkpoint["state_dict"])
-    return model
+    """
+    Deserialize a KAN model from checkpoint.
+    Handles multiple formats:
+    - Direct KAN object with __call__ method
+    - Serialized dict with state_dict and config
+    - Older format: dict with direct model objects (return as-is after to(device))
+    """
+    # If it's already a callable KAN object, ensure it's on the right device
+    if hasattr(checkpoint, "__call__") and hasattr(checkpoint, "forward"):
+        return checkpoint.to(device) if hasattr(checkpoint, "to") else checkpoint
+    
+    # If it's a dict with serialized format, reconstruct the model
+    if isinstance(checkpoint, dict):
+        if "state_dict" in checkpoint and "config" in checkpoint:
+            config = checkpoint["config"].copy()
+            config["device"] = device
+            model = KAN(**config).to(device)
+            model.load_state_dict(checkpoint["state_dict"])
+            return model
+        elif "width" in checkpoint or "grid" in checkpoint:
+            # Handle partially serialized dict format
+            config = checkpoint.copy()
+            config["device"] = device
+            model = KAN(**config).to(device)
+            return model
+    
+    # Last resort: assume it's directly a KAN model instance stored in older format
+    if hasattr(checkpoint, "forward"):
+        return checkpoint.to(device) if hasattr(checkpoint, "to") else checkpoint
+    
+    raise ValueError(f"Unsupported KAN model checkpoint format: {type(checkpoint)}, keys: {checkpoint.keys() if isinstance(checkpoint, dict) else 'N/A'}")
 
 
 def build_args_namespace(parsed) -> SimpleNamespace:
@@ -166,7 +198,7 @@ def train_deepic_multisource(args):
     deepic_optimizer = demo.torch.optim.Adam(deepic.parameters(), lr=args.deepic_lr)
 
     if args.start_epoch > 0:
-        model_path = epoch_model_path(args.start_epoch)
+        model_path = resolve_epoch_model_path(args.start_epoch)
         if Path(model_path).exists():
             deepic.load_state_dict(demo.torch.load(model_path, map_location=args.device))
             print(f"Loaded model from {model_path}")
@@ -320,9 +352,12 @@ def train_deepic_multisource(args):
 
 def load_or_train_deepic(args):
     if getattr(args, "eval_epoch", None) is not None:
-        checkpoint_path = epoch_model_path(args.eval_epoch)
+        checkpoint_path = resolve_epoch_model_path(args.eval_epoch)
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Requested epoch checkpoint not found: {checkpoint_path}")
+            raise FileNotFoundError(
+                f"Requested epoch checkpoint not found: "
+                f"{epoch_model_path(args.eval_epoch, '.pth')} or {epoch_model_path(args.eval_epoch, '.py')}"
+            )
         print(f"Using saved DeepIC epoch checkpoint from {checkpoint_path}")
         deepic = demo.DeepICClass(
             hidden_dim=args.deepic_hidden,
