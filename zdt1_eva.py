@@ -35,6 +35,10 @@ def _save_reward_log(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def epoch_model_path(epoch: int) -> Path:
+    return Path(__file__).resolve().parent / f"zdt1_model_epoch_{epoch}.pth"
+
+
 def deserialize_kan_model(checkpoint: dict, device: str):
     if hasattr(checkpoint, "load_state_dict"):
         return checkpoint
@@ -162,7 +166,7 @@ def train_deepic_multisource(args):
     deepic_optimizer = demo.torch.optim.Adam(deepic.parameters(), lr=args.deepic_lr)
 
     if args.start_epoch > 0:
-        model_path = f"zdt1_model_epoch_{args.start_epoch}.py"
+        model_path = epoch_model_path(args.start_epoch)
         if Path(model_path).exists():
             deepic.load_state_dict(demo.torch.load(model_path, map_location=args.device))
             print(f"Loaded model from {model_path}")
@@ -294,7 +298,7 @@ def train_deepic_multisource(args):
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
         epoch_mean_rewards.append(epoch_mean)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
-        demo.torch.save(deepic.state_dict(), f"zdt1_model_epoch_{epoch+1}.py")
+        demo.torch.save(deepic.state_dict(), epoch_model_path(epoch + 1))
 
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
     print(f"DeepIC model saved to {MODEL_PATH}")
@@ -315,6 +319,19 @@ def train_deepic_multisource(args):
 
 
 def load_or_train_deepic(args):
+    if getattr(args, "eval_epoch", None) is not None:
+        checkpoint_path = epoch_model_path(args.eval_epoch)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Requested epoch checkpoint not found: {checkpoint_path}")
+        print(f"Using saved DeepIC epoch checkpoint from {checkpoint_path}")
+        deepic = demo.DeepICClass(
+            hidden_dim=args.deepic_hidden,
+            n_heads=args.deepic_heads,
+            ff_dim=args.deepic_ff,
+        ).to(args.device)
+        deepic.load_state_dict(demo.torch.load(checkpoint_path, map_location=args.device))
+        return deepic
+
     if Path(MODEL_PATH).exists():
         print(f"Using saved DeepIC model from {MODEL_PATH}")
         deepic = demo.DeepICClass(
@@ -546,6 +563,7 @@ def parse_args():
     parser.add_argument("--dim", type=int, default=30)
     parser.add_argument("--start_epoch", type=int, default=0, help="Start training from this epoch (0-based, load model if exists)")
     parser.add_argument("--train_only", action="store_true", help="Only train the mixed-source DeepIC model")
+    parser.add_argument("--eval_epoch", type=int, default=None, help="Load zdt1_model_epoch_<k>.pth for evaluation/comparison")
     return parser.parse_args()
 
 
