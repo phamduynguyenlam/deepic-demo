@@ -171,6 +171,7 @@ def parse_args():
     parser.add_argument("--deepic_lr", type=float, default=1e-3)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
+    parser.add_argument("--reward", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--compare", action="store_true", help="Compare pre-trained DeepIC-assisted EA against NSGA-EIC on ZDT1")
@@ -572,8 +573,11 @@ def train_zdt2_only(args):
                         upper=problem.upper,
                         progress=sample["progress"],
                         target_ranking=sample["ranking"],
+                        reward=sample["reward"],
                         device=args.device,
                         steps=1,
+                        top_k=args.k_eval,
+                        reward_discount=args.reward,
                     )
 
             true_evals += args.k_eval
