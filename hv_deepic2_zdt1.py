@@ -102,6 +102,17 @@ PROBLEM_NAME = hv_zdt1.PROBLEM_NAME
 REFERENCE_POINT = hv_zdt1.REFERENCE_POINT
 
 
+def _epoch_checkpoint_path(epoch_number: int) -> Path:
+    return Path(__file__).resolve().parent / f"hv_deepic2_zdt1_epoch_{epoch_number}.pth"
+
+
+def _torch_load(path: Path | str, map_location: str):
+    try:
+        return demo.torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return demo.torch.load(path, map_location=map_location)
+
+
 def train_hv_deepic2_zdt1(args):
     demo.set_seed(args.seed)
     problem = hv_zdt1.nda.ZDTProblem(name=PROBLEM_NAME, dim=args.dim)
@@ -127,7 +138,15 @@ def train_hv_deepic2_zdt1(args):
     ).to(args.device)
     deepic_optimizer = demo.torch.optim.Adam(deepic.parameters(), lr=args.deepic_lr)
 
-    for epoch in range(50):
+    if args.start_epoch > 0:
+        checkpoint_path = _epoch_checkpoint_path(args.start_epoch)
+        if checkpoint_path.exists():
+            deepic.load_state_dict(_torch_load(checkpoint_path, args.device))
+            print(f"Loaded model from {checkpoint_path.name}")
+        else:
+            print(f"Checkpoint {checkpoint_path.name} not found, starting from scratch")
+
+    for epoch in range(args.start_epoch, 50):
         print(f"HV_DeepIC2 ZDT1 Epoch {epoch + 1}/50")
 
         archive_x = hv_zdt1.latin_hypercube_sample(
@@ -248,6 +267,7 @@ def train_hv_deepic2_zdt1(args):
             f"HV_DeepIC2 epoch {epoch + 1} done, true_evals={true_evals}, "
             f"front0={front.shape[0]}, hv={hv_value:.6f}, surrogate_nsga_steps={args.surrogate_nsga_steps}"
         )
+        demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(epoch + 1))
 
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
     print(f"HV_DeepIC2 model saved to {MODEL_PATH}")
@@ -493,6 +513,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--dim", type=int, default=30)
+    parser.add_argument(
+        "--start_epoch",
+        type=int,
+        default=0,
+        help="Start training from this epoch checkpoint number, if it exists.",
+    )
     parser.add_argument("--train_only", action="store_true", help="Only train HV_DeepIC2 on ZDT1.")
     return parser.parse_args()
 
