@@ -273,7 +273,7 @@ def train_hv_deepic2_zdt1(args):
         if (epoch + 1) % 5 == 0:
             save_path = f"/content/drive/MyDrive/DeepIC_Models/kan_surrogate_epoch_{epoch+1}.pth"
             import torch
-            torch.save(model.state_dict(), save_path) # (Lưu ý: Thay chữ 'model' bằng tên biến mô hình trong code thực tế)
+            torch.save(deepic.state_dict(), save_path) # (Lưu ý: Thay chữ 'model' bằng tên biến mô hình trong code thực tế)
             print(f"Đã lưu checkpoint vào Drive: {save_path}")
 
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
