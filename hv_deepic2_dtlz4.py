@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -99,6 +100,8 @@ HVDeepIC2Class = load_hv_deepic2_class()
 
 PROBLEM_NAME = "DTLZ4"
 MODEL_PATH = "hv_deepic2_dtlz4.pth"
+REWARD_LOG_DIR = Path(__file__).resolve().parent / "reward_logs"
+REWARD_LOG_PATH = REWARD_LOG_DIR / "hv_deepic2_dtlz4_train_rewards.json"
 
 
 def _reference_point(dim: int) -> np.ndarray:
@@ -114,6 +117,11 @@ def _torch_load(path: Path | str, map_location: str):
         return demo.torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return demo.torch.load(path, map_location=map_location)
+
+
+def _save_reward_log(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def train_hv_deepic2_dtlz4(args):
@@ -135,6 +143,8 @@ def train_hv_deepic2_dtlz4(args):
     ).to(args.device)
     deepic_optimizer = demo.torch.optim.Adam(deepic.parameters(), lr=args.deepic_lr)
     replay = demo.ReplayBuffer(capacity=256)
+    reward_records: list[dict] = []
+    epoch_mean_rewards: list[float] = []
 
     if args.start_epoch > 0:
         checkpoint_path = _epoch_checkpoint_path(args.start_epoch)
@@ -146,6 +156,7 @@ def train_hv_deepic2_dtlz4(args):
 
     for epoch in range(args.start_epoch, 50):
         print(f"HV_DeepIC2 source-mix epoch {epoch + 1}/50")
+        epoch_rewards: list[float] = []
 
         for dim in source_dims:
             for problem_name in source_problems:
@@ -210,6 +221,18 @@ def train_hv_deepic2_dtlz4(args):
                         selected_objectives=selected_y,
                         ref_point=ref_point,
                         epsilon=args.hv_epsilon,
+                    )
+                    reward_value = float(reward)
+                    epoch_rewards.append(reward_value)
+                    reward_records.append(
+                        {
+                            "epoch": epoch + 1,
+                            "problem": problem_name,
+                            "dim": int(dim),
+                            "step": step + 1,
+                            "progress": float(progress),
+                            "reward": reward_value,
+                        }
                     )
 
                     archive_x, archive_y = demo.update_archive(
@@ -279,10 +302,33 @@ def train_hv_deepic2_dtlz4(args):
                     f"front0={front.shape[0]}, hv={hv_value:.6f}, surrogate_nsga_steps={args.surrogate_nsga_steps}"
                 )
 
+        epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
+        epoch_mean_rewards.append(epoch_mean)
+        print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
+
         demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(epoch + 1))
+        if (epoch + 1) % 5 == 0:
+            multisource.save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"hv_deepic2_dtlz4_epoch_{epoch + 1}.pth",
+            )
 
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
     print(f"HV_DeepIC2 model saved to {MODEL_PATH}")
+    _save_reward_log(
+        REWARD_LOG_PATH,
+        {
+            "script": "hv_deepic2_dtlz4.py",
+            "mode": "train_hv_deepic2_dtlz4",
+            "target_problem": PROBLEM_NAME,
+            "model_path": MODEL_PATH,
+            "source_problems": source_problems,
+            "source_dims": source_dims,
+            "epoch_mean_rewards": epoch_mean_rewards,
+            "records": reward_records,
+        },
+    )
+    print(f"Reward log saved to {REWARD_LOG_PATH}")
     return deepic
 
 

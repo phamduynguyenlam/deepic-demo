@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -101,6 +102,13 @@ HVDeepIC2Class = load_hv_deepic2_class()
 MODEL_PATH = "hv_deepic2_zdt1.pth"
 PROBLEM_NAME = hv_zdt1.PROBLEM_NAME
 REFERENCE_POINT = hv_zdt1.REFERENCE_POINT
+REWARD_LOG_DIR = Path(__file__).resolve().parent / "reward_logs"
+REWARD_LOG_PATH = REWARD_LOG_DIR / "hv_deepic2_zdt1_train_rewards.json"
+
+
+def _save_reward_log(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _epoch_checkpoint_path(epoch_number: int) -> Path:
@@ -125,6 +133,8 @@ def train_hv_deepic2_zdt1(args):
     )
 
     replay = demo.ReplayBuffer(capacity=256)
+    reward_records: list[dict] = []
+    epoch_mean_rewards: list[float] = []
     deepic = HVDeepIC2Class(
         hidden_dim=args.deepic_hidden,
         n_heads=args.deepic_heads,
@@ -144,6 +154,7 @@ def train_hv_deepic2_zdt1(args):
 
     for epoch in range(args.start_epoch, 50):
         print(f"HV_DeepIC2 source-mix epoch {epoch + 1}/50")
+        epoch_rewards: list[float] = []
 
         for dim in source_dims:
             for problem_name in source_problems:
@@ -206,6 +217,18 @@ def train_hv_deepic2_zdt1(args):
                         selected_objectives=selected_y,
                         ref_point=ref_point,
                         epsilon=args.hv_epsilon,
+                    )
+                    reward_value = float(reward)
+                    epoch_rewards.append(reward_value)
+                    reward_records.append(
+                        {
+                            "epoch": epoch + 1,
+                            "problem": problem_name,
+                            "dim": int(dim),
+                            "step": step + 1,
+                            "progress": float(progress),
+                            "reward": reward_value,
+                        }
                     )
 
                     archive_x, archive_y = demo.update_archive(
@@ -274,17 +297,31 @@ def train_hv_deepic2_zdt1(args):
                     f"{problem_name}-{dim}D epoch {epoch + 1} done, true_evals={true_evals}, "
                     f"front0={front.shape[0]}, hv={hv_value:.6f}, surrogate_nsga_steps={args.surrogate_nsga_steps}"
                 )
+        epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
+        epoch_mean_rewards.append(epoch_mean)
+        print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(epoch + 1))
-
-        # Chèn đoạn này vào vị trí thích hợp trong vòng lặp epoch
         if (epoch + 1) % 5 == 0:
-            save_path = f"/content/drive/MyDrive/DeepIC_Models/kan_surrogate_epoch_{epoch+1}.pth"
-            import torch
-            torch.save(deepic.state_dict(), save_path) # (Lưu ý: Thay chữ 'model' bằng tên biến mô hình trong code thực tế)
-            print(f"Đã lưu checkpoint vào Drive: {save_path}")
-
+            multisource.save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"hv_deepic2_zdt1_epoch_{epoch + 1}.pth",
+            )
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
     print(f"HV_DeepIC2 model saved to {MODEL_PATH}")
+    _save_reward_log(
+        REWARD_LOG_PATH,
+        {
+            "script": "hv_deepic2_zdt1.py",
+            "mode": "train_hv_deepic2_zdt1",
+            "target_problem": PROBLEM_NAME,
+            "model_path": MODEL_PATH,
+            "source_problems": source_problems,
+            "source_dims": source_dims,
+            "epoch_mean_rewards": epoch_mean_rewards,
+            "records": reward_records,
+        },
+    )
+    print(f"Reward log saved to {REWARD_LOG_PATH}")
     return deepic
 
 

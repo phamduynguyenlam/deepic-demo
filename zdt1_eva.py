@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import demo
+import multisource_eva_common as multisource
 from problem.kan import KAN
 
 
@@ -333,6 +334,11 @@ def train_deepic_multisource(args):
         epoch_mean_rewards.append(epoch_mean)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         demo.torch.save(deepic.state_dict(), epoch_model_path(epoch + 1))
+        if (epoch + 1) % 5 == 0:
+            multisource.save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"zdt1_model_epoch_{epoch + 1}.pth",
+            )
 
     demo.torch.save(deepic.state_dict(), MODEL_PATH)
     print(f"DeepIC model saved to {MODEL_PATH}")

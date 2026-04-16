@@ -27,6 +27,7 @@ ALL_PROBLEMS = ["ZDT1", "ZDT2", "ZDT3", "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTL
 SOURCE_DIMS = [15, 20, 25]
 TRAIN_EPOCHS = 50
 REWARD_LOG_DIR = Path(__file__).resolve().parent / "reward_logs"
+GOOGLE_DRIVE_MODEL_DIR = Path("/content/drive/MyDrive/DeepIC_Models")
 
 
 def _problem_slug(problem_name: str) -> str:
@@ -36,6 +37,24 @@ def _problem_slug(problem_name: str) -> str:
 def _save_reward_log(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def save_colab_model_checkpoint(state_dict, filename: str) -> Path | None:
+    try:
+        if not GOOGLE_DRIVE_MODEL_DIR.exists():
+            try:
+                from google.colab import drive
+            except ImportError:
+                return None
+            drive.mount("/content/drive")
+        GOOGLE_DRIVE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        save_path = GOOGLE_DRIVE_MODEL_DIR / filename
+        demo.torch.save(state_dict, save_path)
+        print(f"Saved Google Drive checkpoint to {save_path}")
+        return save_path
+    except Exception as exc:
+        print(f"Skipping Google Drive checkpoint save: {exc}")
+        return None
 
 
 def _torch_load(path: Path | str, map_location: str):
@@ -372,6 +391,11 @@ def train_deepic_multisource(args, target_problem: str):
         epoch_mean_rewards.append(epoch_mean)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(target_problem, epoch + 1))
+        if (epoch + 1) % 5 == 0:
+            save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"deepic_{_problem_slug(target_problem)}_source_mix_epoch_{epoch + 1}.pth",
+            )
 
         # Chèn đoạn này vào vị trí thích hợp trong vòng lặp epoch
         if (epoch + 1) % 10 == 0:
