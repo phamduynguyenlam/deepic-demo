@@ -275,7 +275,7 @@ def train_hv_deepic2_dtlz3(args):
                                 device=args.device,
                                 steps=1,
                                 top_k=args.k_eval,
-                                reward_discount=args.reward,
+                                reward_discount=args.discount,
                             )
 
                     true_evals += args.k_eval
@@ -560,7 +560,7 @@ def parse_args():
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
     parser.add_argument("--hv_epsilon", type=float, default=1e-8)
-    parser.add_argument("--reward", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
+    parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--dim", type=int, default=30)

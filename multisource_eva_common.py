@@ -167,7 +167,7 @@ def build_args_namespace(parsed) -> SimpleNamespace:
         deepic_lr=parsed.deepic_lr,
         deepic_adapt_steps=parsed.deepic_adapt_steps,
         surrogate_nsga_steps=parsed.surrogate_nsga_steps,
-        reward=parsed.reward,
+        discount=parsed.discount,
         seed=parsed.seed,
         device=parsed.device,
     )
@@ -386,7 +386,7 @@ def train_deepic_multisource(args, target_problem: str):
                                 device=args.device,
                                 steps=1,
                                 top_k=args.k_eval,
-                                reward_discount=args.reward,
+                                reward_discount=args.discount,
                             )
 
                     true_evals += args.k_eval
@@ -647,7 +647,7 @@ def parse_args(target_problem: str):
     parser.add_argument("--deepic_lr", type=float, default=1e-3)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
-    parser.add_argument("--reward", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
+    parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--dim", type=int, default=30)

@@ -1075,7 +1075,7 @@ def train_deepic_zdt(args):
                             device=args.device,
                             steps=1,
                             top_k=args.k_eval,
-                            reward_discount=args.reward,
+                            reward_discount=args.discount,
                         )
 
                 true_evals += args.k_eval
@@ -1205,7 +1205,7 @@ def train_deepic_zdt1(args):
                         device=args.device,
                         steps=1,
                         top_k=args.k_eval,
-                        reward_discount=args.reward,
+                        reward_discount=args.discount,
                     )
 
             true_evals += args.k_eval
@@ -1256,7 +1256,7 @@ def parse_args():
     parser.add_argument("--deepic_lr", type=float, default=1e-3)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--max_fe", type=int, default=160)
-    parser.add_argument("--reward", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
+    parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--use_saea", action='store_true', help="Use SAEA + DeepIC training loop")

@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-3)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--reward", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
+    parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--compare", action="store_true", help="Compare pre-trained DeepIC-assisted EA against NSGA-SURR on ZDT1")
