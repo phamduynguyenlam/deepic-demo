@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import demo
+import multisource_eva_common as multisource
 from infil_criterion import EIC
 
 
@@ -599,6 +600,11 @@ def train_zdt2_only(args):
         print(
             f"ZDT2 epoch {epoch + 1} done, true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0])}\n"
         )
+        if (epoch + 1) % 5 == 0:
+            multisource.save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"deepic_zdt2_epoch_{epoch + 1}.pth",
+            )
 
     demo.torch.save(deepic.state_dict(), "deepic_zdt2.pth")
     print("DeepIC model saved to deepic_zdt2.pth")

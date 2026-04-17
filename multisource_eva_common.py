@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,7 +28,9 @@ ALL_PROBLEMS = ["ZDT1", "ZDT2", "ZDT3", "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTL
 SOURCE_DIMS = [15, 20, 25]
 TRAIN_EPOCHS = 50
 REWARD_LOG_DIR = Path(__file__).resolve().parent / "reward_logs"
-GOOGLE_DRIVE_MODEL_DIR = Path("/content/drive/MyDrive/DeepIC_Models")
+KAGGLE_MODEL_DIR = Path("/kaggle/working/DeepIC_Models")
+COLAB_MODEL_DIR = Path("/content/drive/MyDrive/DeepIC_Models")
+LOCAL_MODEL_DIR = Path("./DeepIC_Models")
 
 
 def _problem_slug(problem_name: str) -> str:
@@ -41,19 +44,27 @@ def _save_reward_log(path: Path, payload: dict) -> None:
 
 def save_colab_model_checkpoint(state_dict, filename: str) -> Path | None:
     try:
-        if not GOOGLE_DRIVE_MODEL_DIR.exists():
-            try:
-                from google.colab import drive
-            except ImportError:
-                return None
-            drive.mount("/content/drive")
-        GOOGLE_DRIVE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        save_path = GOOGLE_DRIVE_MODEL_DIR / filename
+        if "KAGGLE_URL_BASE" in os.environ:
+            save_dir = KAGGLE_MODEL_DIR
+        elif Path("/content").exists():
+            save_dir = COLAB_MODEL_DIR
+            if not Path("/content/drive").exists():
+                try:
+                    from google.colab import drive
+                except ImportError:
+                    save_dir = LOCAL_MODEL_DIR
+                else:
+                    drive.mount("/content/drive")
+        else:
+            save_dir = LOCAL_MODEL_DIR
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / filename
         demo.torch.save(state_dict, save_path)
-        print(f"Saved Google Drive checkpoint to {save_path}")
+        print(f"--> [Auto-Save] Saved checkpoint to: {save_path}")
         return save_path
     except Exception as exc:
-        print(f"Skipping Google Drive checkpoint save: {exc}")
+        print(f"Skipping auto-save checkpoint: {exc}")
         return None
 
 
@@ -397,14 +408,6 @@ def train_deepic_multisource(args, target_problem: str):
                 f"deepic_{_problem_slug(target_problem)}_source_mix_epoch_{epoch + 1}.pth",
             )
 
-        # Chèn đoạn này vào vị trí thích hợp trong vòng lặp epoch
-        if (epoch + 1) % 10 == 0:
-            save_path = f"/content/drive/MyDrive/DeepIC_Models/kan_surrogate_epoch_{epoch+1}.pth"
-            import torch
-            torch.save(deepic.state_dict(), save_path) # (Lưu ý: Thay chữ 'model' bằng tên biến mô hình trong code thực tế)
-            print(f"Đã lưu checkpoint vào Drive: {save_path}")
-        
-            demo.torch.save(deepic.state_dict(), model_path)
     print(f"DeepIC model saved to {model_path.name}")
     _save_reward_log(
         reward_log_path,

@@ -12,6 +12,7 @@ import torch
 import matplotlib.pyplot as plt
 from pymoo.indicators.hv import HV
 
+import multisource_eva_common as multisource
 from problem.kan import KAN
 from optimizer.Surr_RLDE_Optimizer import SAEA
 
@@ -1085,6 +1086,11 @@ def train_deepic_zdt(args):
             print(
                 f"{p_name} epoch {epoch+1} done, true_evals={true_evals}, best_obj1={np.min(archive_y[:,0])}\n"
             )
+        if (epoch + 1) % 5 == 0:
+            multisource.save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"deepic_zdt_epoch_{epoch + 1}.pth",
+            )
 
     # Save the trained DeepIC model
     torch.save(deepic.state_dict(), 'deepic_zdt.pth')
@@ -1221,6 +1227,11 @@ def train_deepic_zdt1(args):
         print(
             f"ZDT1 epoch {epoch + 1} done, true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0])}\n"
         )
+        if (epoch + 1) % 5 == 0:
+            multisource.save_colab_model_checkpoint(
+                deepic.state_dict(),
+                f"deepic_zdt1_epoch_{epoch + 1}.pth",
+            )
 
     torch.save(deepic.state_dict(), 'deepic_zdt1.pth')
     print("DeepIC model saved to deepic_zdt1.pth")
