@@ -250,10 +250,24 @@ def pretrain_source_surrogates(args, target_problem: str) -> dict:
 
 
 def _attach_discounted_returns(episode_trajectory: list[dict], discount: float) -> None:
+    if not episode_trajectory:
+        return
+
+    returns: list[float] = []
     discounted_return = 0.0
     for sample in reversed(episode_trajectory):
         discounted_return = float(sample["reward"]) + float(discount) * discounted_return
-        sample["return"] = float(discounted_return)
+        returns.append(float(discounted_return))
+    returns.reverse()
+
+    returns_array = np.asarray(returns, dtype=np.float32)
+    if returns_array.size > 1:
+        returns_std = float(returns_array.std())
+        if returns_std > 1e-8:
+            returns_array = (returns_array - float(returns_array.mean())) / returns_std
+
+    for sample, normalized_return in zip(episode_trajectory, returns_array.tolist()):
+        sample["return"] = float(normalized_return)
 
 
 def _update_deepic_from_episode(
@@ -267,12 +281,6 @@ def _update_deepic_from_episode(
         return 0.0
 
     returns = [float(sample["return"]) for sample in episode_trajectory]
-    returns_array = np.asarray(returns, dtype=np.float32)
-    if returns_array.size > 1:
-        returns_std = float(returns_array.std())
-        if returns_std > 1e-8:
-            returns_array = (returns_array - float(returns_array.mean())) / returns_std
-    returns = returns_array.tolist()
 
     model.train()
     optimizer.zero_grad()
