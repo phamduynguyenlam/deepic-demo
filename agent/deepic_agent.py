@@ -384,7 +384,7 @@ class _DeepICBase(nn.Module):
                 break
 
         if not improved:
-            return -1.0
+            return 0.0
 
         reward = 1.0
         origin = np.zeros(previous_front.shape[1], dtype=np.float32)

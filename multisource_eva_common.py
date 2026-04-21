@@ -249,10 +249,112 @@ def pretrain_source_surrogates(args, target_problem: str) -> dict:
     return cache
 
 
+def _attach_discounted_returns(episode_trajectory: list[dict], discount: float) -> None:
+    discounted_return = 0.0
+    for sample in reversed(episode_trajectory):
+        discounted_return = float(sample["reward"]) + float(discount) * discounted_return
+        sample["return"] = float(discounted_return)
+
+
+def _update_deepic_from_episode(
+    model,
+    optimizer,
+    episode_trajectory: list[dict],
+    device: str,
+    top_k: int,
+) -> float:
+    if not episode_trajectory:
+        return 0.0
+
+    returns = [float(sample["return"]) for sample in episode_trajectory]
+    returns_array = np.asarray(returns, dtype=np.float32)
+    if returns_array.size > 1:
+        returns_std = float(returns_array.std())
+        if returns_std > 1e-8:
+            returns_array = (returns_array - float(returns_array.mean())) / returns_std
+    returns = returns_array.tolist()
+
+    model.train()
+    optimizer.zero_grad()
+    episode_loss = None
+    total_samples = len(episode_trajectory)
+
+    grouped_indices: dict[tuple[tuple[int, ...], ...], list[int]] = {}
+    for idx, sample in enumerate(episode_trajectory):
+        key = (
+            sample["archive_x"].shape,
+            sample["archive_y"].shape,
+            sample["offspring_x"].shape,
+            sample["offspring_pred"].shape,
+            sample["offspring_sigma"].shape,
+        )
+        grouped_indices.setdefault(key, []).append(idx)
+
+    for indices in grouped_indices.values():
+        batch_samples = [episode_trajectory[idx] for idx in indices]
+        ranking = demo.torch.as_tensor(
+            np.stack([sample["ranking"] for sample in batch_samples], axis=0),
+            dtype=demo.torch.long,
+            device=device,
+        )
+        out = model(
+            x_true=demo.torch.as_tensor(
+                np.stack([sample["archive_x"] for sample in batch_samples], axis=0),
+                dtype=demo.torch.float32,
+                device=device,
+            ),
+            y_true=demo.torch.as_tensor(
+                np.stack([sample["archive_y"] for sample in batch_samples], axis=0),
+                dtype=demo.torch.float32,
+                device=device,
+            ),
+            x_sur=demo.torch.as_tensor(
+                np.stack([sample["offspring_x"] for sample in batch_samples], axis=0),
+                dtype=demo.torch.float32,
+                device=device,
+            ),
+            y_sur=demo.torch.as_tensor(
+                np.stack([sample["offspring_pred"] for sample in batch_samples], axis=0),
+                dtype=demo.torch.float32,
+                device=device,
+            ),
+            sigma_sur=demo.torch.as_tensor(
+                np.stack([sample["offspring_sigma"] for sample in batch_samples], axis=0),
+                dtype=demo.torch.float32,
+                device=device,
+            ),
+            progress=demo.torch.as_tensor(
+                [sample["progress"] for sample in batch_samples],
+                dtype=demo.torch.float32,
+                device=device,
+            ),
+            lower_bound=batch_samples[0]["lower"],
+            upper_bound=batch_samples[0]["upper"],
+            target_ranking=ranking,
+            decode_type="greedy",
+        )
+
+        log_prob = model.sequence_log_prob(out["logits"], ranking, top_k=top_k)
+        advantage = demo.torch.as_tensor(
+            [returns[idx] for idx in indices],
+            dtype=demo.torch.float32,
+            device=device,
+        )
+        batch_loss = -(advantage.detach() * log_prob).sum()
+        episode_loss = batch_loss if episode_loss is None else episode_loss + batch_loss
+
+    if episode_loss is None:
+        return 0.0
+
+    episode_loss = episode_loss / max(total_samples, 1)
+    episode_loss.backward()
+    optimizer.step()
+    return float(episode_loss.detach().cpu())
+
+
 def train_deepic_multisource(args, target_problem: str):
     demo.set_seed(args.seed)
     pretrain_cache = pretrain_source_surrogates(args, target_problem)
-    replay = demo.ReplayBuffer(capacity=256)
     reward_records: list[dict] = []
     epoch_mean_rewards: list[float] = []
     model_path = _final_model_path(target_problem)
@@ -278,10 +380,13 @@ def train_deepic_multisource(args, target_problem: str):
         epoch_rewards: list[float] = []
 
         for dim in SOURCE_DIMS:
+            dim_trajectories: list[dict] = []
+            dim_problem_count = 0
             for problem_name in source_problems_for(target_problem):
                 entry = pretrain_cache[(problem_name, dim)]
                 problem = entry["problem"]
                 surrogates = entry["models"]
+                episode_trajectory: list[dict] = []
 
                 archive_x = latin_hypercube_sample(
                     lower=problem.lower,
@@ -296,18 +401,24 @@ def train_deepic_multisource(args, target_problem: str):
                 steps_to_run = remaining_budget // args.k_eval
 
                 for step in range(steps_to_run):
-                    offspring_x = demo.generate_offspring(
-                        archive_x=archive_x,
+                    archive_x_t = archive_x.copy()
+                    archive_y_t = archive_y.copy()
+
+                    offspring_x, offspring_pred = nsga_eic.generate_nsga2_pseudo_front(
+                        archive_x=archive_x_t,
+                        problem=problem,
+                        surrogates=surrogates,
+                        device=args.device,
                         n_offspring=args.offspring_size,
-                        lower=problem.lower,
-                        upper=problem.upper,
                         sigma=args.mutation_sigma,
+                        surrogate_nsga_steps=args.surrogate_nsga_steps,
+                        predict_fn=demo.predict_with_kan,
+                        generate_fn=demo.generate_offspring,
                     )
-                    offspring_pred = demo.predict_with_kan(surrogates, offspring_x, args.device).astype(np.float32)
-                    archive_pred = demo.predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
+                    archive_pred = demo.predict_with_kan(surrogates, archive_x_t, args.device).astype(np.float32)
                     offspring_sigma = demo.estimate_uncertainty(
-                        archive_x=archive_x,
-                        archive_y=archive_y,
+                        archive_x=archive_x_t,
+                        archive_y=archive_y_t,
                         archive_pred=archive_pred,
                         offspring_x=offspring_x,
                     ).astype(np.float32)
@@ -315,8 +426,8 @@ def train_deepic_multisource(args, target_problem: str):
                     progress = float(true_evals / args.max_fe)
                     ranking = demo.infer_deepic_ranking(
                         model=deepic,
-                        archive_x=archive_x,
-                        archive_y=archive_y,
+                        archive_x=archive_x_t,
+                        archive_y=archive_y_t,
                         offspring_x=offspring_x,
                         offspring_pred=offspring_pred,
                         offspring_sigma=offspring_sigma,
@@ -331,7 +442,7 @@ def train_deepic_multisource(args, target_problem: str):
                     selected_y = problem.evaluate(selected_x)
 
                     reward = demo.DeepICClass.fpareto_improvement_reward(
-                        previous_front=archive_y,
+                        previous_front=archive_y_t,
                         selected_objectives=selected_y,
                     )
                     reward_value = float(reward)
@@ -346,56 +457,53 @@ def train_deepic_multisource(args, target_problem: str):
                             "reward": reward_value,
                         }
                     )
-                    archive_x, archive_y = demo.update_archive(
-                        archive_x=archive_x,
-                        archive_y=archive_y,
-                        new_x=selected_x,
-                        new_y=selected_y,
-                    )
 
-                    replay.add(
+                    episode_trajectory.append(
                         {
-                            "archive_x": archive_x,
-                            "archive_y": archive_y,
+                            "archive_x": archive_x_t,
+                            "archive_y": archive_y_t,
                             "offspring_x": offspring_x,
                             "offspring_pred": offspring_pred,
                             "offspring_sigma": offspring_sigma,
                             "ranking": ranking,
-                            "reward": reward,
+                            "reward": reward_value,
                             "progress": progress,
                             "lower": problem.lower,
                             "upper": problem.upper,
                         }
                     )
 
-                    if len(replay) >= 32:
-                        for sample in replay.sample(32):
-                            demo.adapt_deepic(
-                                model=deepic,
-                                optimizer=deepic_optimizer,
-                                archive_x=sample["archive_x"],
-                                archive_y=sample["archive_y"],
-                                offspring_x=sample["offspring_x"],
-                                offspring_pred=sample["offspring_pred"],
-                                offspring_sigma=sample["offspring_sigma"],
-                                lower=sample["lower"],
-                                upper=sample["upper"],
-                                progress=sample["progress"],
-                                target_ranking=sample["ranking"],
-                                reward=sample["reward"],
-                                device=args.device,
-                                steps=1,
-                                top_k=args.k_eval,
-                                reward_discount=args.discount,
-                            )
+                    archive_x, archive_y = demo.update_archive(
+                        archive_x=archive_x_t,
+                        archive_y=archive_y_t,
+                        new_x=selected_x,
+                        new_y=selected_y,
+                    )
 
                     true_evals += args.k_eval
                     if true_evals >= args.max_fe:
                         break
 
+                _attach_discounted_returns(episode_trajectory, float(args.discount))
+                dim_trajectories.extend(episode_trajectory)
+                dim_problem_count += 1
+
                 print(
                     f"{problem_name}-{dim}D epoch {epoch + 1} done, "
                     f"true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0]):.6f}"
+                )
+
+            if dim_trajectories:
+                dim_loss = _update_deepic_from_episode(
+                    model=deepic,
+                    optimizer=deepic_optimizer,
+                    episode_trajectory=dim_trajectories,
+                    device=args.device,
+                    top_k=args.k_eval,
+                )
+                print(
+                    f"Updated DeepIC for {dim}D with {dim_problem_count} problems "
+                    f"({len(dim_trajectories)} rollout steps), loss={dim_loss:.6f}"
                 )
 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
@@ -408,6 +516,7 @@ def train_deepic_multisource(args, target_problem: str):
                 f"deepic_{_problem_slug(target_problem)}_source_mix_epoch_{epoch + 1}.pth",
             )
 
+    demo.torch.save(deepic.state_dict(), model_path)
     print(f"DeepIC model saved to {model_path.name}")
     _save_reward_log(
         reward_log_path,
