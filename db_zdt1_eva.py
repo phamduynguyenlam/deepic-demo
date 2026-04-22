@@ -92,10 +92,36 @@ def _archive_hv(values: np.ndarray, ref_point: np.ndarray) -> float:
     return float(demo.hypervolume_2d(front, ref_point))
 
 
-def _normalized_hv_reward(previous_archive: np.ndarray, selected_y: np.ndarray, ref_point: np.ndarray, epsilon: float) -> float:
+def _db_saea_reward(
+    previous_archive: np.ndarray,
+    selected_y: np.ndarray,
+    ref_point: np.ndarray,
+    reward_lambda: float,
+    epsilon: float,
+) -> float:
+    previous_archive = np.asarray(previous_archive, dtype=np.float32)
+    selected_y = np.asarray(selected_y, dtype=np.float32)
     prev_hv = _archive_hv(previous_archive, ref_point)
     next_hv = _archive_hv(np.vstack([previous_archive, selected_y]), ref_point)
-    return float((next_hv - prev_hv) / (prev_hv + float(epsilon)))
+    if next_hv <= prev_hv + float(epsilon):
+        return -1.0
+
+    fronts, _ = demo.fast_non_dominated_sort(previous_archive)
+    pareto_front = (
+        previous_archive[np.asarray(fronts[0], dtype=np.int64)]
+        if fronts and fronts[0]
+        else previous_archive
+    )
+    origin = np.zeros(pareto_front.shape[1], dtype=np.float32)
+    ratios: list[float] = []
+    for candidate in selected_y:
+        distances = np.abs(pareto_front - candidate).sum(axis=1)
+        nearest_idx = int(np.argmin(distances))
+        d = float(distances[nearest_idx])
+        d_ref = float(np.abs(pareto_front[nearest_idx] - origin).sum())
+        ratios.append(d / max(d_ref, 1e-12))
+    mean_ratio = float(np.mean(ratios)) if ratios else 0.0
+    return float(1.0 + float(reward_lambda) * mean_ratio)
 
 
 def _build_state(
@@ -336,8 +362,8 @@ def _write_infer_notebook(notebook_path: Path, result_json_path: Path) -> None:
                 "source": [
                     "plt.figure(figsize=(8, 5))\n",
                     "plt.title(result['title_hv'])\n",
-                    "plt.plot(result['db_saea']['hv_history'], marker='o', label='DB-SAEA')\n",
-                    "plt.plot(result['nsga_eic']['hv_history'], marker='s', label='NSGA-EIC')\n",
+                    "plt.plot(result['db_saea']['hv_history'], marker='o', markersize=5, label='DB-SAEA')\n",
+                    "plt.plot(result['nsga_eic']['hv_history'], marker='s', markersize=5, label='NSGA-EIC')\n",
                     "plt.xlabel('Step')\n",
                     "plt.ylabel('Hypervolume')\n",
                     "plt.grid(True)\n",
@@ -356,8 +382,8 @@ def _write_infer_notebook(notebook_path: Path, result_json_path: Path) -> None:
                     "true_front = np.asarray(result['db_saea']['true_front'], dtype=np.float32)\n",
                     "plt.figure(figsize=(8, 5))\n",
                     "plt.title(result['title_front'])\n",
-                    "plt.scatter(db_front[:, 0], db_front[:, 1], s=24, alpha=0.8, label='DB-SAEA')\n",
-                    "plt.scatter(eic_front[:, 0], eic_front[:, 1], s=24, alpha=0.8, label='NSGA-EIC')\n",
+                    "plt.scatter(db_front[:, 0], db_front[:, 1], s=20, alpha=0.8, label='DB-SAEA')\n",
+                    "plt.scatter(eic_front[:, 0], eic_front[:, 1], s=20, alpha=0.8, label='NSGA-EIC')\n",
                     "plt.plot(true_front[:, 0], true_front[:, 1], 'k-', linewidth=2, label='True Pareto Front')\n",
                     "plt.xlabel('f1')\n",
                     "plt.ylabel('f2')\n",
@@ -475,10 +501,11 @@ def train_db_multisource(args):
                         selected_idx = ranking[: args.k_eval]
                         selected_x = offspring_x[selected_idx]
                         selected_y = problem.evaluate(selected_x)
-                        reward_value = _normalized_hv_reward(
+                        reward_value = _db_saea_reward(
                             previous_archive=archive_y,
                             selected_y=selected_y,
                             ref_point=ref_point,
+                            reward_lambda=args.reward_lambda,
                             epsilon=args.hv_epsilon,
                         )
 
@@ -728,7 +755,7 @@ def run_db_saea_zdt1(args, policy, plot: bool = True, initial_archive_x: np.ndar
     if plot:
         plt.figure(figsize=(8, 5))
         plt.title(f"{args.dim}D ZDT1 Hypervolume Comparison")
-        plt.plot(hv_history, marker="o", label="DB-SAEA")
+        plt.plot(hv_history, marker="o", markersize=5, label="DB-SAEA")
         plt.xlabel("Step")
         plt.ylabel("Hypervolume")
         plt.grid(True)
@@ -737,7 +764,7 @@ def run_db_saea_zdt1(args, policy, plot: bool = True, initial_archive_x: np.ndar
 
         plt.figure(figsize=(8, 5))
         plt.title(f"{args.dim}D ZDT1 Pareto Front")
-        plt.scatter(final_front[:, 0], final_front[:, 1], s=24, alpha=0.8, label="DB-SAEA")
+        plt.scatter(final_front[:, 0], final_front[:, 1], s=20, alpha=0.8, label="DB-SAEA")
         plt.plot(true_front[:, 0], true_front[:, 1], "k-", linewidth=2, label="True Pareto Front")
         plt.xlabel("f1")
         plt.ylabel("f2")
@@ -782,8 +809,8 @@ def run_comparison(args):
 
     plt.figure(figsize=(8, 5))
     plt.title(f"{args.dim}D ZDT1 Hypervolume Comparison")
-    plt.plot(db_result["hv_history"], marker="o", label="DB-SAEA")
-    plt.plot(eic_result["hv_history"], marker="s", label="NSGA-EIC")
+    plt.plot(db_result["hv_history"], marker="o", markersize=5, label="DB-SAEA")
+    plt.plot(eic_result["hv_history"], marker="s", markersize=5, label="NSGA-EIC")
     plt.xlabel("Step")
     plt.ylabel("Hypervolume")
     plt.grid(True)
@@ -792,8 +819,8 @@ def run_comparison(args):
 
     plt.figure(figsize=(8, 5))
     plt.title(f"{args.dim}D ZDT1 Pareto Front Comparison")
-    plt.scatter(db_result["final_front"][:, 0], db_result["final_front"][:, 1], s=24, alpha=0.8, label="DB-SAEA")
-    plt.scatter(eic_result["final_front"][:, 0], eic_result["final_front"][:, 1], s=24, alpha=0.8, label="NSGA-EIC")
+    plt.scatter(db_result["final_front"][:, 0], db_result["final_front"][:, 1], s=20, alpha=0.8, label="DB-SAEA")
+    plt.scatter(eic_result["final_front"][:, 0], eic_result["final_front"][:, 1], s=20, alpha=0.8, label="NSGA-EIC")
     plt.plot(db_result["true_front"][:, 0], db_result["true_front"][:, 1], "k-", linewidth=2, label="True Pareto Front")
     plt.xlabel("f1")
     plt.ylabel("f2")
@@ -846,6 +873,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--replay_capacity", type=int, default=50000)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--reward_lambda", type=float, default=1.0)
     parser.add_argument("--hv_epsilon", type=float, default=1e-8)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=7)
