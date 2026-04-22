@@ -138,16 +138,28 @@ def _kan_checkpoint_path(problem_name: str, dim: int) -> Path:
     return Path(__file__).resolve().parent / f"kan_{_problem_slug(problem_name)}_{dim}d.pth"
 
 
-def _epoch_checkpoint_path(problem_name: str, epoch_number: int) -> Path:
+def _training_label(self_train_only: bool = False) -> str:
+    return "self_only" if self_train_only else "source_mix"
+
+
+def _script_variant(self_train_only: bool = False) -> str:
+    return "demo" if self_train_only else "eva"
+
+
+def _epoch_checkpoint_path(problem_name: str, epoch_number: int, self_train_only: bool = False) -> Path:
+    if self_train_only:
+        return Path(__file__).resolve().parent / f"{_problem_slug(problem_name)}_self_model_epoch_{epoch_number}.pth"
     return Path(__file__).resolve().parent / f"{_problem_slug(problem_name)}_model_epoch_{epoch_number}.pth"
 
 
-def _final_model_path(problem_name: str) -> Path:
+def _final_model_path(problem_name: str, self_train_only: bool = False) -> Path:
+    if self_train_only:
+        return Path(__file__).resolve().parent / f"deepic_{_problem_slug(problem_name)}_self_only.pth"
     return Path(__file__).resolve().parent / f"deepic_{_problem_slug(problem_name)}_source_mix.pth"
 
 
-def _reward_log_path(problem_name: str) -> Path:
-    return REWARD_LOG_DIR / f"{_problem_slug(problem_name)}_eva_train_rewards.json"
+def _reward_log_path(problem_name: str, self_train_only: bool = False) -> Path:
+    return REWARD_LOG_DIR / f"{_problem_slug(problem_name)}_{_script_variant(self_train_only)}_train_rewards.json"
 
 
 def build_args_namespace(parsed) -> SimpleNamespace:
@@ -189,6 +201,12 @@ def latin_hypercube_sample(lower, upper, n_samples: int, dim: int, seed: int) ->
 
 def source_problems_for(target_problem: str) -> list[str]:
     return [problem_name for problem_name in ALL_PROBLEMS if problem_name != target_problem]
+
+
+def training_problems_for(target_problem: str, self_train_only: bool = False) -> list[str]:
+    if self_train_only:
+        return [target_problem]
+    return source_problems_for(target_problem)
 
 
 def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
@@ -241,10 +259,10 @@ def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
     }
 
 
-def pretrain_source_surrogates(args, target_problem: str) -> dict:
+def pretrain_source_surrogates(args, target_problem: str, self_train_only: bool = False) -> dict:
     cache = {}
     for dim in SOURCE_DIMS:
-        for problem_name in source_problems_for(target_problem):
+        for problem_name in training_problems_for(target_problem, self_train_only=self_train_only):
             cache[(problem_name, dim)] = load_or_prepare_kan_surrogate(problem_name, dim, args)
     return cache
 
@@ -360,13 +378,13 @@ def _update_deepic_from_episode(
     return float(episode_loss.detach().cpu())
 
 
-def train_deepic_multisource(args, target_problem: str):
+def train_deepic_multisource(args, target_problem: str, self_train_only: bool = False):
     demo.set_seed(args.seed)
-    pretrain_cache = pretrain_source_surrogates(args, target_problem)
+    pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
     epoch_mean_rewards: list[float] = []
-    model_path = _final_model_path(target_problem)
-    reward_log_path = _reward_log_path(target_problem)
+    model_path = _final_model_path(target_problem, self_train_only=self_train_only)
+    reward_log_path = _reward_log_path(target_problem, self_train_only=self_train_only)
 
     deepic = demo.DeepICClass(
         hidden_dim=args.deepic_hidden,
@@ -376,7 +394,7 @@ def train_deepic_multisource(args, target_problem: str):
     deepic_optimizer = demo.torch.optim.Adam(deepic.parameters(), lr=args.deepic_lr)
 
     if args.start_epoch > 0:
-        checkpoint_path = _epoch_checkpoint_path(target_problem, args.start_epoch)
+        checkpoint_path = _epoch_checkpoint_path(target_problem, args.start_epoch, self_train_only=self_train_only)
         if checkpoint_path.exists():
             deepic.load_state_dict(_torch_load(checkpoint_path, args.device))
             print(f"Loaded model from {checkpoint_path.name}")
@@ -390,7 +408,7 @@ def train_deepic_multisource(args, target_problem: str):
         for dim in SOURCE_DIMS:
             dim_trajectories: list[dict] = []
             dim_problem_count = 0
-            for problem_name in source_problems_for(target_problem):
+            for problem_name in training_problems_for(target_problem, self_train_only=self_train_only):
                 entry = pretrain_cache[(problem_name, dim)]
                 problem = entry["problem"]
                 surrogates = entry["models"]
@@ -517,11 +535,14 @@ def train_deepic_multisource(args, target_problem: str):
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
         epoch_mean_rewards.append(epoch_mean)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
-        demo.torch.save(deepic.state_dict(), _epoch_checkpoint_path(target_problem, epoch + 1))
+        demo.torch.save(
+            deepic.state_dict(),
+            _epoch_checkpoint_path(target_problem, epoch + 1, self_train_only=self_train_only),
+        )
         if (epoch + 1) % 5 == 0:
             save_colab_model_checkpoint(
                 deepic.state_dict(),
-                f"deepic_{_problem_slug(target_problem)}_source_mix_epoch_{epoch + 1}.pth",
+                f"deepic_{_problem_slug(target_problem)}_{_training_label(self_train_only)}_epoch_{epoch + 1}.pth",
             )
 
     demo.torch.save(deepic.state_dict(), model_path)
@@ -529,12 +550,13 @@ def train_deepic_multisource(args, target_problem: str):
     _save_reward_log(
         reward_log_path,
         {
-            "script": f"{_problem_slug(target_problem)}_eva.py",
+            "script": f"{_problem_slug(target_problem)}_{_script_variant(self_train_only)}.py",
             "mode": "train_deepic_multisource",
             "target_problem": target_problem,
             "model_path": str(model_path),
-            "source_problems": source_problems_for(target_problem),
+            "training_problems": training_problems_for(target_problem, self_train_only=self_train_only),
             "source_dims": SOURCE_DIMS,
+            "training_label": _training_label(self_train_only),
             "epoch_mean_rewards": epoch_mean_rewards,
             "records": reward_records,
         },
@@ -543,8 +565,8 @@ def train_deepic_multisource(args, target_problem: str):
     return deepic
 
 
-def load_or_train_deepic(args, target_problem: str):
-    model_path = _final_model_path(target_problem)
+def load_or_train_deepic(args, target_problem: str, self_train_only: bool = False):
+    model_path = _final_model_path(target_problem, self_train_only=self_train_only)
     if model_path.exists():
         print(f"Using saved DeepIC model from {model_path.name}")
         deepic = demo.DeepICClass(
@@ -554,7 +576,7 @@ def load_or_train_deepic(args, target_problem: str):
         ).to(args.device)
         deepic.load_state_dict(_torch_load(model_path, args.device))
         return deepic
-    return train_deepic_multisource(args, target_problem)
+    return train_deepic_multisource(args, target_problem, self_train_only=self_train_only)
 
 
 def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True, initial_archive_x: np.ndarray = None):
@@ -696,8 +718,8 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
     }
 
 
-def run_comparison(args, target_problem: str):
-    deepic = load_or_train_deepic(args, target_problem)
+def run_comparison(args, target_problem: str, self_train_only: bool = False):
+    deepic = load_or_train_deepic(args, target_problem, self_train_only=self_train_only)
     problem = nda.ZDTProblem(name=target_problem, dim=args.dim)
     shared_init_x = latin_hypercube_sample(
         lower=problem.lower,
@@ -752,7 +774,7 @@ def parse_args(target_problem: str):
     )
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
-    parser.add_argument("--k_eval", type=int, default=5)
+    parser.add_argument("--k_eval", type=int, default=1)
     parser.add_argument("--max_fe", type=int, default=160)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
@@ -778,12 +800,12 @@ def parse_args(target_problem: str):
     return parser.parse_args()
 
 
-def main_for_problem(target_problem: str):
+def main_for_problem(target_problem: str, self_train_only: bool = False):
     args = parse_args(target_problem)
     if args.dim != 30:
         print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
     if args.train_only:
-        train_deepic_multisource(args, target_problem)
+        train_deepic_multisource(args, target_problem, self_train_only=self_train_only)
     else:
-        run_comparison(args, target_problem)
+        run_comparison(args, target_problem, self_train_only=self_train_only)
