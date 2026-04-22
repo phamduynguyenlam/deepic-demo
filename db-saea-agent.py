@@ -598,10 +598,11 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
 
     @ray.remote(num_cpus=1)
     class DBSAEARolloutWorker:
-        def __init__(self, worker_id: int, task_name: str, env_factory):
+        def __init__(self, worker_id: int, task_name: str, env_factory, replay_buffer):
             self.worker_id = worker_id
             self.task_name = task_name
             self.env = env_factory(task_name, worker_id)
+            self.replay_buffer = replay_buffer
             self.local_policy = DBSAEAMetaPolicy(**policy_kwargs).cpu()
             self.local_policy.eval()
 
@@ -613,7 +614,7 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
             weights: dict[str, Any],
             epsilon: float,
             max_steps: int = 50,
-        ) -> list[dict[str, Any]]:
+        ) -> int:
             self.sync_weights(weights)
             transitions: list[dict[str, Any]] = []
             state = self.env.reset()
@@ -646,7 +647,9 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
                 if done:
                     break
 
-            return transitions
+            if transitions:
+                self.replay_buffer.add.remote(transitions)
+            return len(transitions)
 
     return DBSAEARolloutWorker
 
@@ -698,7 +701,12 @@ def train_db_saea_distributed(
 
     worker_tasks = [task_names[idx % len(task_names)] for idx in range(num_workers)]
     workers = [
-        worker_actor_cls.remote(worker_id=idx, task_name=worker_tasks[idx], env_factory=env_factory)
+        worker_actor_cls.remote(
+            worker_id=idx,
+            task_name=worker_tasks[idx],
+            env_factory=env_factory,
+            replay_buffer=replay_buffer,
+        )
         for idx in range(num_workers)
     ]
 
@@ -721,10 +729,7 @@ def train_db_saea_distributed(
             )
             for worker in workers
         ]
-        rollout_batches = ray.get(rollout_futures)
-        for transitions in rollout_batches:
-            if transitions:
-                replay_buffer.add.remote(transitions)
+        rollout_counts = ray.get(rollout_futures)
 
         batch = ray.get(replay_buffer.sample.remote(batch_size))
         loss = learner.update_model(batch=batch, gamma=gamma, grad_clip=grad_clip)
@@ -740,6 +745,7 @@ def train_db_saea_distributed(
                 "loss": float(loss),
                 "epsilon": float(epsilon),
                 "buffer_size": float(buffer_size),
+                "rollout_transitions": float(sum(rollout_counts)),
             }
         )
 
