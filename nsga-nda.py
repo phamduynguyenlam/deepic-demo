@@ -49,6 +49,20 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def latin_hypercube_sample(lower, upper, n_samples: int, dim: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    lower_arr = np.full(dim, lower, dtype=np.float32) if np.isscalar(lower) else np.asarray(lower, dtype=np.float32)
+    upper_arr = np.full(dim, upper, dtype=np.float32) if np.isscalar(upper) else np.asarray(upper, dtype=np.float32)
+
+    lhs = np.empty((n_samples, dim), dtype=np.float32)
+    for j in range(dim):
+        perm = rng.permutation(n_samples)
+        lhs[:, j] = (perm + rng.random(n_samples)) / n_samples
+
+    samples = lower_arr + lhs * (upper_arr - lower_arr)
+    return samples.astype(np.float32)
+
+
 class ZDTProblem:
     def __init__(self, name: str, dim: int = 30):
         self.name = name
@@ -429,7 +443,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_nsga_nda(args, plot: bool = True):
+def run_nsga_nda(args, plot: bool = True, initial_archive_x: np.ndarray | None = None):
     set_seed(args.seed)
     if args.max_fe < args.archive_size:
         raise ValueError("max_fe must be at least as large as archive_size.")
@@ -449,7 +463,18 @@ def run_nsga_nda(args, plot: bool = True):
     )
     print(f"Pre-trained KAN surrogate on ZDT1 with {pretrain_x.shape[0]} samples.")
 
-    archive_x = np.random.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
+    if initial_archive_x is None:
+        archive_x = latin_hypercube_sample(
+            lower=problem.lower,
+            upper=problem.upper,
+            n_samples=args.archive_size,
+            dim=args.dim,
+            seed=args.seed,
+        )
+    else:
+        archive_x = np.asarray(initial_archive_x, dtype=np.float32).copy()
+        if archive_x.shape != (args.archive_size, args.dim):
+            raise ValueError("initial_archive_x must have shape (archive_size, dim).")
     archive_y = problem.evaluate(archive_x)
 
     true_evals = args.archive_size
@@ -457,6 +482,15 @@ def run_nsga_nda(args, plot: bool = True):
     steps_to_run = remaining_budget // args.k_eval
     hv_history: list[float] = []
     reward_history: list[float] = []
+
+    fronts, _ = fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    initial_hv = hypervolume_2d(front, ref_point)
+    hv_history.append(initial_hv)
+    print(
+        f"Init    | archive={archive_x.shape[0]} | "
+        f"front0={front.shape[0]} | HV={initial_hv:.6f}"
+    )
 
     for step in range(steps_to_run):
         offspring_x = generate_offspring(
@@ -581,8 +615,15 @@ def run_comparison(args):
         print("deepic_zdt1.pth not found. Training DeepIC on ZDT1 first...")
         deepic_model = demo.train_deepic_zdt1(args)
 
-    deepic_result = demo.run_infer_zdt1(args, deepic=deepic_model, plot=False)
-    nsga_result = run_nsga_nda(args, plot=False)
+    shared_init_x = latin_hypercube_sample(
+        lower=0.0,
+        upper=1.0,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = demo.run_infer_zdt1(args, deepic=deepic_model, plot=False, initial_archive_x=shared_init_x)
+    nsga_result = run_nsga_nda(args, plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-NDA final HV: {nsga_result['hv_history'][-1]:.6f}")

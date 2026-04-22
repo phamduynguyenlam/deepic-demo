@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import numpy as np
+from pymoo.indicators.hv import HV
 
 import demo
 from problem.kan import KAN
@@ -139,7 +140,7 @@ def _kan_checkpoint_path(problem_name: str, dim: int) -> Path:
 
 
 def _training_label(self_train_only: bool = False) -> str:
-    return "self_only" if self_train_only else "source_mix"
+    return "hv_self_only" if self_train_only else "hv_source_mix"
 
 
 def _script_variant(self_train_only: bool = False) -> str:
@@ -148,18 +149,44 @@ def _script_variant(self_train_only: bool = False) -> str:
 
 def _epoch_checkpoint_path(problem_name: str, epoch_number: int, self_train_only: bool = False) -> Path:
     if self_train_only:
-        return Path(__file__).resolve().parent / f"{_problem_slug(problem_name)}_self_model_epoch_{epoch_number}.pth"
-    return Path(__file__).resolve().parent / f"{_problem_slug(problem_name)}_model_epoch_{epoch_number}.pth"
+        return Path(__file__).resolve().parent / f"hv_{_problem_slug(problem_name)}_self_model_epoch_{epoch_number}.pth"
+    return Path(__file__).resolve().parent / f"hv_{_problem_slug(problem_name)}_model_epoch_{epoch_number}.pth"
 
 
 def _final_model_path(problem_name: str, self_train_only: bool = False) -> Path:
     if self_train_only:
-        return Path(__file__).resolve().parent / f"deepic_{_problem_slug(problem_name)}_self_only.pth"
-    return Path(__file__).resolve().parent / f"deepic_{_problem_slug(problem_name)}_source_mix.pth"
+        return Path(__file__).resolve().parent / f"hv_deepic_{_problem_slug(problem_name)}_self_only.pth"
+    return Path(__file__).resolve().parent / f"hv_deepic_{_problem_slug(problem_name)}_source_mix.pth"
 
 
 def _reward_log_path(problem_name: str, self_train_only: bool = False) -> Path:
-    return REWARD_LOG_DIR / f"{_problem_slug(problem_name)}_{_script_variant(self_train_only)}_train_rewards.json"
+    return REWARD_LOG_DIR / f"hv_{_problem_slug(problem_name)}_{_script_variant(self_train_only)}_train_rewards.json"
+
+
+def _hypervolume(values: np.ndarray, ref_point: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return 0.0
+    fronts, _ = demo.fast_non_dominated_sort(values)
+    if not fronts or not fronts[0]:
+        return 0.0
+    front = values[np.asarray(fronts[0], dtype=np.int64)]
+    return float(HV(ref_point=np.asarray(ref_point, dtype=np.float32))(front))
+
+
+def _normalized_hv_improvement_reward(
+    previous_archive: np.ndarray,
+    selected_objectives: np.ndarray,
+    ref_point: np.ndarray,
+    epsilon: float = 1e-8,
+) -> float:
+    previous_archive = np.asarray(previous_archive, dtype=np.float32)
+    selected_objectives = np.asarray(selected_objectives, dtype=np.float32)
+    combined_archive = np.vstack([previous_archive, selected_objectives])
+
+    previous_hv = _hypervolume(previous_archive, ref_point)
+    next_hv = _hypervolume(combined_archive, ref_point)
+    return float((next_hv - previous_hv) / (previous_hv + float(epsilon)))
 
 
 def build_args_namespace(parsed) -> SimpleNamespace:
@@ -179,6 +206,7 @@ def build_args_namespace(parsed) -> SimpleNamespace:
         deepic_lr=parsed.deepic_lr,
         deepic_adapt_steps=parsed.deepic_adapt_steps,
         surrogate_nsga_steps=parsed.surrogate_nsga_steps,
+        hv_epsilon=parsed.hv_epsilon,
         discount=parsed.discount,
         seed=parsed.seed,
         device=parsed.device,
@@ -412,6 +440,7 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                 entry = pretrain_cache[(problem_name, dim)]
                 problem = entry["problem"]
                 surrogates = entry["models"]
+                ref_point = nsga_eic._reference_point(problem_name, dim)
                 episode_trajectory: list[dict] = []
 
                 archive_x = latin_hypercube_sample(
@@ -467,9 +496,11 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                     selected_x = offspring_x[selected_idx]
                     selected_y = problem.evaluate(selected_x)
 
-                    reward = demo.DeepICClass.fpareto_improvement_reward(
-                        previous_front=archive_y_t,
+                    reward = _normalized_hv_improvement_reward(
+                        previous_archive=archive_y_t,
                         selected_objectives=selected_y,
+                        ref_point=ref_point,
+                        epsilon=args.hv_epsilon,
                     )
                     reward_value = float(reward)
                     epoch_rewards.append(reward_value)
@@ -542,21 +573,22 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
         if (epoch + 1) % 5 == 0:
             save_colab_model_checkpoint(
                 deepic.state_dict(),
-                f"deepic_{_problem_slug(target_problem)}_{_training_label(self_train_only)}_epoch_{epoch + 1}.pth",
+                f"hv_deepic_{_problem_slug(target_problem)}_{'self_only' if self_train_only else 'source_mix'}_epoch_{epoch + 1}.pth",
             )
 
     demo.torch.save(deepic.state_dict(), model_path)
-    print(f"DeepIC model saved to {model_path.name}")
+    print(f"HV-reward DeepIC model saved to {model_path.name}")
     _save_reward_log(
         reward_log_path,
         {
-            "script": f"{_problem_slug(target_problem)}_{_script_variant(self_train_only)}.py",
-            "mode": "train_deepic_multisource",
+            "script": f"hv_{_problem_slug(target_problem)}_{_script_variant(self_train_only)}.py",
+            "mode": "train_hv_deepic_multisource",
             "target_problem": target_problem,
             "model_path": str(model_path),
             "training_problems": training_problems_for(target_problem, self_train_only=self_train_only),
             "source_dims": SOURCE_DIMS,
             "training_label": _training_label(self_train_only),
+            "reward_type": "normalized_hv_improvement",
             "epoch_mean_rewards": epoch_mean_rewards,
             "records": reward_records,
         },
@@ -654,9 +686,11 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         selected_x = offspring_x[selected_idx]
         selected_y = problem.evaluate(selected_x)
         reward_value = float(
-            demo.DeepICClass.fpareto_improvement_reward(
-                previous_front=archive_y,
+            _normalized_hv_improvement_reward(
+                previous_archive=archive_y,
                 selected_objectives=selected_y,
+                ref_point=ref_point,
+                epsilon=args.hv_epsilon,
             )
         )
         reward_history.append(reward_value)
@@ -779,7 +813,7 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False):
 
 def parse_args(target_problem: str):
     parser = argparse.ArgumentParser(
-        description=f"Train SAEA-DeepIC on 15D/20D/25D source problems and evaluate on 30D {target_problem}"
+        description=f"Train SAEA-DeepIC with normalized HV-improvement reward on 15D/20D/25D source problems and evaluate on 30D {target_problem}"
     )
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
@@ -795,6 +829,7 @@ def parse_args(target_problem: str):
     parser.add_argument("--deepic_lr", type=float, default=1e-3)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
+    parser.add_argument("--hv_epsilon", type=float, default=1e-8)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")

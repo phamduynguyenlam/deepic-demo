@@ -339,7 +339,13 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
     print(f"Pre-trained KAN surrogate on {problem_name} with {pretrain_x.shape[0]} samples.")
 
     if initial_archive_x is None:
-        archive_x = np.random.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
+        archive_x = multisource.latin_hypercube_sample(
+            lower=problem.lower,
+            upper=problem.upper,
+            n_samples=args.archive_size,
+            dim=args.dim,
+            seed=args.seed,
+        )
     else:
         archive_x = np.asarray(initial_archive_x, dtype=np.float32).copy()
         if archive_x.shape != (args.archive_size, args.dim):
@@ -353,6 +359,16 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
     steps_to_run = remaining_budget // args.k_eval
     hv_history: list[float] = []
     reward_history: list[float] = []
+
+    fronts, _ = nda.fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    hv_front = _normalize_for_hv(problem_name, front, args.dim)
+    initial_hv = nda.hypervolume_2d(hv_front, ref_point)
+    hv_history.append(initial_hv)
+    print(
+        f"Init    | archive={archive_x.shape[0]} | "
+        f"front0={front.shape[0]} | HV={initial_hv:.6f}"
+    )
 
     for step in range(steps_to_run):
         offspring_x, offspring_pred = generate_nsga2_pseudo_front(
@@ -611,7 +627,13 @@ def train_zdt2_only(args):
     return deepic
 
 
-def run_deepic_problem(args, problem_name: str, plot: bool = True, checkpoint_path: Optional[str] = None):
+def run_deepic_problem(
+    args,
+    problem_name: str,
+    plot: bool = True,
+    checkpoint_path: Optional[str] = None,
+    initial_archive_x: Optional[np.ndarray] = None,
+):
     if problem_name not in {"ZDT1", "ZDT2", "ZDT7", "DTLZ1", "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTLZ6", "DTLZ7"}:
         raise ValueError(f"Unsupported problem: {problem_name}")
 
@@ -661,7 +683,18 @@ def run_deepic_problem(args, problem_name: str, plot: bool = True, checkpoint_pa
             print(f"{checkpoint_path} not found. Training DeepIC on ZDT1-6 first...")
             deepic = demo.train_deepic_zdt(args)
 
-    archive_x = np.random.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
+    if initial_archive_x is None:
+        archive_x = multisource.latin_hypercube_sample(
+            lower=problem.lower,
+            upper=problem.upper,
+            n_samples=args.archive_size,
+            dim=args.dim,
+            seed=args.seed,
+        )
+    else:
+        archive_x = np.asarray(initial_archive_x, dtype=np.float32).copy()
+        if archive_x.shape != (args.archive_size, args.dim):
+            raise ValueError("initial_archive_x must have shape (archive_size, dim).")
     archive_y = problem.evaluate(archive_x)
     ref_point = _reference_point(problem_name, args.dim)
 
@@ -670,6 +703,16 @@ def run_deepic_problem(args, problem_name: str, plot: bool = True, checkpoint_pa
     steps_to_run = remaining_budget // args.k_eval
     hv_history: list[float] = []
     reward_history: list[float] = []
+
+    fronts, _ = demo.fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    hv_front = _normalize_for_hv(problem_name, front, args.dim)
+    initial_hv = demo.hypervolume_2d(hv_front, ref_point)
+    hv_history.append(initial_hv)
+    print(
+        f"Init    | archive={archive_x.shape[0]} | "
+        f"front0={front.shape[0]} | HV={initial_hv:.6f}"
+    )
 
     for step in range(steps_to_run):
         surrogates = demo.fit_kan_surrogates(
@@ -803,8 +846,22 @@ def run_comparison(args):
         print("deepic_zdt1.pth not found. Training DeepIC on ZDT1 first...")
         demo.train_deepic_zdt1(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="ZDT1", plot=False, checkpoint_path="deepic_zdt1.pth")
-    eic_result = run_nsga_eic(args, plot=False)
+    problem = nda.ZDTProblem(name="ZDT1", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="ZDT1",
+        plot=False,
+        checkpoint_path="deepic_zdt1.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="ZDT1", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -859,8 +916,22 @@ def run_comparison_zdt2(args):
         print("deepic_zdt.pth not found. Training DeepIC on ZDT1-6 first...")
         demo.train_deepic_zdt(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="ZDT2", plot=False, checkpoint_path="deepic_zdt.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name="ZDT2", plot=False)
+    problem = nda.ZDTProblem(name="ZDT2", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="ZDT2",
+        plot=False,
+        checkpoint_path="deepic_zdt.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="ZDT2", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -915,8 +986,22 @@ def run_comparison_zdt7(args):
         print("deepic_zdt.pth not found. Training DeepIC on ZDT1-6 first...")
         demo.train_deepic_zdt(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="ZDT7", plot=False, checkpoint_path="deepic_zdt.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name="ZDT7", plot=False)
+    problem = nda.ZDTProblem(name="ZDT7", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="ZDT7",
+        plot=False,
+        checkpoint_path="deepic_zdt.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="ZDT7", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -971,8 +1056,22 @@ def run_comparison_dtlz1(args):
         print("deepic_zdt.pth not found. Training DeepIC on ZDT1-6 first...")
         demo.train_deepic_zdt(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="DTLZ1", plot=False, checkpoint_path="deepic_zdt.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name="DTLZ1", plot=False)
+    problem = nda.ZDTProblem(name="DTLZ1", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="DTLZ1",
+        plot=False,
+        checkpoint_path="deepic_zdt.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="DTLZ1", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -1027,8 +1126,22 @@ def run_comparison_dtlz2(args):
         print("deepic_zdt.pth not found. Training DeepIC on ZDT1-6 first...")
         demo.train_deepic_zdt(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="DTLZ2", plot=False, checkpoint_path="deepic_zdt.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name="DTLZ2", plot=False)
+    problem = nda.ZDTProblem(name="DTLZ2", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="DTLZ2",
+        plot=False,
+        checkpoint_path="deepic_zdt.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="DTLZ2", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -1063,8 +1176,22 @@ def run_comparison_dtlz3(args):
         print("deepic_zdt.pth not found. Training DeepIC on ZDT1-6 first...")
         demo.train_deepic_zdt(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="DTLZ3", plot=False, checkpoint_path="deepic_zdt.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name="DTLZ3", plot=False)
+    problem = nda.ZDTProblem(name="DTLZ3", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="DTLZ3",
+        plot=False,
+        checkpoint_path="deepic_zdt.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="DTLZ3", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -1119,8 +1246,22 @@ def run_comparison_zdt2_only_model(args):
         print("deepic_zdt2.pth not found. Training DeepIC on ZDT2 first...")
         train_zdt2_only(args)
 
-    deepic_result = run_deepic_problem(args, problem_name="ZDT2", plot=False, checkpoint_path="deepic_zdt2.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name="ZDT2", plot=False)
+    problem = nda.ZDTProblem(name="ZDT2", dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name="ZDT2",
+        plot=False,
+        checkpoint_path="deepic_zdt2.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name="ZDT2", plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
@@ -1175,8 +1316,22 @@ def _run_generic_comparison(args, problem_name: str):
         print("deepic_zdt.pth not found. Training DeepIC on ZDT1-6 first...")
         demo.train_deepic_zdt(args)
 
-    deepic_result = run_deepic_problem(args, problem_name=problem_name, plot=False, checkpoint_path="deepic_zdt.pth")
-    eic_result = run_nsga_eic_problem(args, problem_name=problem_name, plot=False)
+    problem = nda.ZDTProblem(name=problem_name, dim=args.dim)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
+    deepic_result = run_deepic_problem(
+        args,
+        problem_name=problem_name,
+        plot=False,
+        checkpoint_path="deepic_zdt.pth",
+        initial_archive_x=shared_init_x,
+    )
+    eic_result = run_nsga_eic_problem(args, problem_name=problem_name, plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")

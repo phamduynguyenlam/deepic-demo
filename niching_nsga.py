@@ -213,7 +213,13 @@ def run_niching_nsga(args, plot: bool = True, initial_archive_x: np.ndarray | No
     pretrain_x, pretrain_y, surrogates = _fit_surrogates_with_pretrain(problem, args)
 
     if initial_archive_x is None:
-        archive_x = np.random.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
+        archive_x = multisource.latin_hypercube_sample(
+            lower=problem.lower,
+            upper=problem.upper,
+            n_samples=args.archive_size,
+            dim=args.dim,
+            seed=args.seed,
+        )
     else:
         archive_x = np.asarray(initial_archive_x, dtype=np.float32).copy()
         if archive_x.shape != (args.archive_size, args.dim):
@@ -223,6 +229,16 @@ def run_niching_nsga(args, plot: bool = True, initial_archive_x: np.ndarray | No
     true_evals = args.archive_size
     steps_to_run = (args.max_fe - true_evals) // k_eval_total
     hv_history: list[float] = []
+
+    fronts, _ = nda.fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    hv_front = nsga_eic._normalize_for_hv(args.problem, front, args.dim)
+    initial_hv = nda.hypervolume_2d(hv_front, ref_point)
+    hv_history.append(initial_hv)
+    print(
+        f"[Niching-NSGA] Init    | archive={archive_x.shape[0]} | "
+        f"front0={front.shape[0]} | HV={initial_hv:.6f}"
+    )
 
     for step in range(steps_to_run):
         pop1_x, pop1_pred = nsga_eic.generate_nsga2_pseudo_front(
@@ -333,9 +349,14 @@ def run_niching_nsga(args, plot: bool = True, initial_archive_x: np.ndarray | No
 
 
 def run_comparison(args):
-    rng = np.random.default_rng(args.seed)
     problem = nda.ZDTProblem(name=args.problem, dim=args.dim)
-    shared_init_x = rng.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
+    shared_init_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
 
     niching_result = run_niching_nsga(args, plot=False, initial_archive_x=shared_init_x)
     baseline_args = SimpleNamespace(**vars(args))

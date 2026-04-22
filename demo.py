@@ -53,6 +53,20 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def latin_hypercube_sample(lower, upper, n_samples: int, dim: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    lower_arr = np.full(dim, lower, dtype=np.float32) if np.isscalar(lower) else np.asarray(lower, dtype=np.float32)
+    upper_arr = np.full(dim, upper, dtype=np.float32) if np.isscalar(upper) else np.asarray(upper, dtype=np.float32)
+
+    lhs = np.empty((n_samples, dim), dtype=np.float32)
+    for j in range(dim):
+        perm = rng.permutation(n_samples)
+        lhs[:, j] = (perm + rng.random(n_samples)) / n_samples
+
+    samples = lower_arr + lhs * (upper_arr - lower_arr)
+    return samples.astype(np.float32)
+
+
 class ToyMultiObjectiveProblem:
     def __init__(self, dim: int, n_obj: int, lower: float = 0.0, upper: float = 1.0):
         self.dim = dim
@@ -662,7 +676,13 @@ def infer_zdt7(args, deepic=None):
     )
     print(f"Pre-trained KAN surrogate on ZDT7 with {pretrain_x.shape[0]} samples.")
 
-    archive_x = np.random.uniform(problem.lower, problem.upper, size=(80, args.dim)).astype(np.float32)
+    archive_x = latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=80,
+        dim=args.dim,
+        seed=args.seed,
+    )
     archive_y = problem.evaluate(archive_x)
     
     # Set FIXED reference point for ZDT7 (from literature)
@@ -677,6 +697,11 @@ def infer_zdt7(args, deepic=None):
     steps_to_run = remaining_budget // args.k_eval
 
     hv_history = []
+    fronts, _ = fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    initial_hv = hypervolume_2d(front, ref_point)
+    hv_history.append(initial_hv)
+    print(f"Init    | archive={archive_x.shape[0]} | front0={front.shape[0]} | Hypervolume: {initial_hv:.6f}")
     for step in range(steps_to_run):
         offspring_x = generate_offspring(
             archive_x=archive_x,
@@ -771,7 +796,7 @@ def infer_zdt7(args, deepic=None):
     return archive_x, archive_y
 
 
-def run_infer_zdt1(args, deepic=None, plot: bool = True):
+def run_infer_zdt1(args, deepic=None, plot: bool = True, initial_archive_x: np.ndarray | None = None):
     if deepic is None:
         deepic = DeepICClass(
             hidden_dim=args.deepic_hidden,
@@ -790,7 +815,18 @@ def run_infer_zdt1(args, deepic=None, plot: bool = True):
         problem_name='ZDT1',
     )
     print(f"Pre-trained KAN surrogate on ZDT1 with {pretrain_x.shape[0]} samples.")
-    archive_x = np.random.uniform(problem.lower, problem.upper, size=(80, args.dim)).astype(np.float32)
+    if initial_archive_x is None:
+        archive_x = latin_hypercube_sample(
+            lower=problem.lower,
+            upper=problem.upper,
+            n_samples=80,
+            dim=args.dim,
+            seed=args.seed,
+        )
+    else:
+        archive_x = np.asarray(initial_archive_x, dtype=np.float32).copy()
+        if archive_x.shape != (80, args.dim):
+            raise ValueError("initial_archive_x must have shape (80, dim).")
     archive_y = problem.evaluate(archive_x)
     
     ref_point = REFERENCE_POINTS["ZDT1"][:2].astype(np.float32)
@@ -801,6 +837,11 @@ def run_infer_zdt1(args, deepic=None, plot: bool = True):
     steps_to_run = remaining_budget // args.k_eval
 
     hv_history = []
+    fronts, _ = fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    initial_hv = hypervolume_2d(front, ref_point)
+    hv_history.append(initial_hv)
+    print(f"Init    | archive={archive_x.shape[0]} | front0={front.shape[0]} | Hypervolume: {initial_hv:.6f}")
     for step in range(steps_to_run):
         surrogates = fit_kan_surrogates(
             archive_x=archive_x,

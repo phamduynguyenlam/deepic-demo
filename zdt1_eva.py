@@ -427,6 +427,15 @@ def run_saea_deepic_zdt1(args, deepic, plot: bool = True, initial_archive_x: np.
     steps_to_run = (args.max_fe - true_evals) // args.k_eval
     hv_history = []
 
+    fronts, _ = demo.fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    initial_hv = demo.hypervolume_2d(front, ref_point)
+    hv_history.append(initial_hv)
+    print(
+        f"Init    | archive={archive_x.shape[0]} | "
+        f"front0={front.shape[0]} | HV={initial_hv:.6f}"
+    )
+
     for step in range(steps_to_run):
         offspring_x, offspring_pred = nsga_eic.generate_nsga2_pseudo_front(
             archive_x=archive_x,
@@ -589,7 +598,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train DeepIC on mixed source problems and evaluate on 30D ZDT1")
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
-    parser.add_argument("--k_eval", type=int, default=5)
+    parser.add_argument("--k_eval", type=int, default=1)
     parser.add_argument("--max_fe", type=int, default=160)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)

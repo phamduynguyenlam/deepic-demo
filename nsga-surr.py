@@ -71,7 +71,12 @@ def select_surr(offspring_pred: np.ndarray, k: int) -> np.ndarray:
     return np.asarray(chosen[:k], dtype=np.int64)
 
 
-def run_nsga_surr_problem(args, problem_name: str, plot: bool = True):
+def run_nsga_surr_problem(
+    args,
+    problem_name: str,
+    plot: bool = True,
+    initial_archive_x: Optional[np.ndarray] = None,
+):
     nda.set_seed(args.seed)
     if args.max_fe < args.archive_size:
         raise ValueError("max_fe must be at least as large as archive_size.")
@@ -91,12 +96,33 @@ def run_nsga_surr_problem(args, problem_name: str, plot: bool = True):
     )
     print(f"Pre-trained KAN surrogate on {problem_name} with {pretrain_x.shape[0]} samples.")
 
-    archive_x = np.random.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
+    if initial_archive_x is None:
+        archive_x = eic_base.multisource.latin_hypercube_sample(
+            lower=problem.lower,
+            upper=problem.upper,
+            n_samples=args.archive_size,
+            dim=args.dim,
+            seed=args.seed,
+        )
+    else:
+        archive_x = np.asarray(initial_archive_x, dtype=np.float32).copy()
+        if archive_x.shape != (args.archive_size, args.dim):
+            raise ValueError("initial_archive_x must have shape (archive_size, dim).")
     archive_y = problem.evaluate(archive_x)
 
     true_evals = args.archive_size
     steps_to_run = (args.max_fe - true_evals) // args.k_eval
     hv_history: list[float] = []
+
+    fronts, _ = nda.fast_non_dominated_sort(archive_y)
+    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+    hv_front = eic_base._normalize_for_hv(problem_name, front, args.dim)
+    initial_hv = nda.hypervolume_2d(hv_front, ref_point)
+    hv_history.append(initial_hv)
+    print(
+        f"Init    | archive={archive_x.shape[0]} | "
+        f"front0={front.shape[0]} | HV={initial_hv:.6f}"
+    )
 
     for step in range(steps_to_run):
         offspring_x = nda.generate_offspring(
@@ -179,13 +205,22 @@ def run_nsga_surr(args, plot: bool = True):
 
 
 def run_comparison_problem(args, problem_name: str, checkpoint_path: Optional[str] = None):
+    problem = nda.ZDTProblem(name=problem_name, dim=args.dim)
+    shared_init_x = eic_base.multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=args.archive_size,
+        dim=args.dim,
+        seed=args.seed,
+    )
     deepic_result = eic_base.run_deepic_problem(
         args,
         problem_name=problem_name,
         plot=False,
         checkpoint_path=checkpoint_path,
+        initial_archive_x=shared_init_x,
     )
-    surr_result = run_nsga_surr_problem(args, problem_name=problem_name, plot=False)
+    surr_result = run_nsga_surr_problem(args, problem_name=problem_name, plot=False, initial_archive_x=shared_init_x)
 
     print(f"\nDeepIC-assisted EA final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-SURR final HV: {surr_result['hv_history'][-1]:.6f}")
