@@ -153,6 +153,25 @@ def _policy_inputs_from_state(state: dict, device: str) -> dict:
     return policy_state
 
 
+def _select_action_with_a1_cap(policy, policy_state: dict, epsilon: float, a1_count: int, max_a1_actions: int) -> int:
+    if int(a1_count) < int(max_a1_actions):
+        return int(
+            policy.select_action(
+                **policy_state,
+                epsilon=float(epsilon),
+            )
+        )
+
+    with torch.no_grad():
+        q_values = policy.forward(**policy_state)[0].detach().cpu().numpy()
+
+    non_a1_actions = np.arange(1, len(ACTION_NAMES), dtype=np.int64)
+    if np.random.rand() < float(epsilon):
+        return int(np.random.choice(non_a1_actions))
+    best_local = int(np.argmax(q_values[1:]))
+    return int(non_a1_actions[best_local])
+
+
 def _generate_surrogate_population(problem, surrogates, archive_x: np.ndarray, archive_y: np.ndarray, args) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     offspring_x, offspring_pred = nsga_eic.generate_nsga2_pseudo_front(
         archive_x=archive_x,
@@ -409,7 +428,8 @@ def train_db_multisource(args):
     demo.set_seed(args.seed)
     print(
         f"Training config | dqn_lr={args.dqn_lr:.1e} | "
-        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | reward_lambda={args.reward_lambda:.4f}"
+        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | reward_lambda={args.reward_lambda:.4f} | "
+        f"max_fe={args.max_fe} | max_a1_actions={args.max_a1_actions}"
     )
     replay = GlobalReplayBuffer(capacity=args.replay_capacity)
     learner = DistributedLearner(
@@ -457,6 +477,7 @@ def train_db_multisource(args):
                 archive_y = problem.evaluate(archive_x)
                 true_evals = args.archive_size
                 step = 0
+                a1_count = 0
 
                 state, offspring_x, offspring_pred, offspring_sigma = _next_state_after_transition(
                     problem=problem,
@@ -470,11 +491,15 @@ def train_db_multisource(args):
                 while true_evals < args.max_fe:
                     step += 1
                     policy_state = _policy_inputs_from_state(state, args.device)
-                    action = learner.global_policy.select_action(
-                        **policy_state,
+                    action = _select_action_with_a1_cap(
+                        policy=learner.global_policy,
+                        policy_state=policy_state,
                         epsilon=epsilon,
+                        a1_count=a1_count,
+                        max_a1_actions=args.max_a1_actions,
                     )
                     if action == 0:
+                        a1_count += 1
                         reward_value = 0.0
                         archive_x_next = archive_x
                         archive_y_next = archive_y
@@ -589,7 +614,7 @@ def train_db_multisource(args):
                 epsilon = max(float(args.epsilon_end), float(epsilon) * float(args.epsilon_decay))
                 print(
                     f"{problem_name}-{dim}D epoch {epoch + 1} done, "
-                    f"true_evals={true_evals}, eps={epsilon:.4f}, best_obj1={np.min(archive_y[:, 0]):.6f}"
+                    f"true_evals={true_evals}, a1_count={a1_count}, eps={epsilon:.4f}, best_obj1={np.min(archive_y[:, 0]):.6f}"
                 )
 
         mean_reward = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
@@ -675,6 +700,7 @@ def run_db_saea_zdt1(args, policy, plot: bool = True, initial_archive_x: np.ndar
     action_history: list[str] = []
     q_value_history: list[list[float]] = []
     step = 0
+    a1_count = 0
     fronts, _ = demo.fast_non_dominated_sort(archive_y)
     print(
         f"Init    | archive={archive_x.shape[0]} | "
@@ -697,8 +723,12 @@ def run_db_saea_zdt1(args, policy, plot: bool = True, initial_archive_x: np.ndar
             **policy_state,
         )
         q_values = q_bundle["q_values"][0].detach().cpu().numpy()
-        action = int(np.argmax(q_values))
+        if a1_count >= args.max_a1_actions:
+            action = int(1 + np.argmax(q_values[1:]))
+        else:
+            action = int(np.argmax(q_values))
         if action == 0:
+            a1_count += 1
             hv_value = hv_history[-1]
         else:
             ranking = _ranking_for_action(
@@ -725,7 +755,7 @@ def run_db_saea_zdt1(args, policy, plot: bool = True, initial_archive_x: np.ndar
 
         print(
             f"Iter {step:02d} | archive={archive_x.shape[0]} | "
-            f"HV={hv_value:.6f} | action={ACTION_NAMES[action]} | pseudo_front={offspring_x.shape[0]}"
+            f"HV={hv_value:.6f} | action={ACTION_NAMES[action]} | a1_count={a1_count} | pseudo_front={offspring_x.shape[0]}"
         )
 
         if action != 0:
@@ -853,7 +883,8 @@ def parse_args():
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
     parser.add_argument("--k_eval", type=int, default=1)
-    parser.add_argument("--max_fe", type=int, default=160)
+    parser.add_argument("--max_fe", type=int, default=120)
+    parser.add_argument("--max_a1_actions", type=int, default=40)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
     parser.add_argument("--kan_hidden", type=int, default=10)
