@@ -216,7 +216,7 @@ def _random_unit_reference_vector(n_obj: int, rng: np.random.Generator) -> np.nd
     return (vec / norm).astype(np.float32)
 
 
-def _pd_value(values: np.ndarray, ref_vector: np.ndarray) -> np.ndarray:
+def _pd_value(values: np.ndarray, ref_vector: np.ndarray, theta: float = 5.0) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
     ref_vector = np.asarray(ref_vector, dtype=np.float32)
     ref_norm = np.linalg.norm(ref_vector)
@@ -224,15 +224,10 @@ def _pd_value(values: np.ndarray, ref_vector: np.ndarray) -> np.ndarray:
         ref_vector = np.full(ref_vector.shape[0], 1.0 / np.sqrt(max(ref_vector.shape[0], 1)), dtype=np.float32)
         ref_norm = np.linalg.norm(ref_vector)
 
-    d1 = values.mean(axis=1)
-    proj_coeff = (values @ ref_vector) / max(ref_norm ** 2, 1e-12)
-    projection = proj_coeff[:, None] * ref_vector[None, :]
-    vertical = np.linalg.norm(values - projection, axis=1)
-    value_norm = np.linalg.norm(values, axis=1)
-    denom = np.maximum(value_norm * ref_norm, 1e-12)
-    cos_theta = np.clip((values @ ref_vector) / denom, -1.0, 1.0)
-    sin_theta = np.sqrt(np.maximum(1.0 - cos_theta ** 2, 0.0))
-    return d1 + 5.0 * vertical * sin_theta
+    d1 = (values @ ref_vector) / max(ref_norm, 1e-12)
+    projection = (d1 / max(ref_norm, 1e-12))[:, None] * ref_vector[None, :]
+    d2 = np.linalg.norm(values - projection, axis=1)
+    return d1 + float(theta) * d2
 
 
 def _epdi_statistics(
