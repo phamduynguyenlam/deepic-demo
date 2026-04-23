@@ -287,6 +287,7 @@ class _DeepICBase(nn.Module):
         progress: torch.Tensor,
         target_ranking: torch.Tensor | None = None,
         decode_type: str = "greedy",
+        max_decode_steps: int | None = None,
     ) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
@@ -302,6 +303,7 @@ class _DeepICBase(nn.Module):
         upper_bound,
         target_ranking: torch.Tensor | None = None,
         decode_type: str = "greedy",
+        max_decode_steps: int | None = None,
     ) -> dict[str, torch.Tensor]:
         encoded = self.encode(
             x_true=x_true,
@@ -319,6 +321,7 @@ class _DeepICBase(nn.Module):
             progress=encoded["progress"],
             target_ranking=target_ranking,
             decode_type=decode_type,
+            max_decode_steps=max_decode_steps,
         )
         encoded.update(decoded)
         return encoded
@@ -483,6 +486,7 @@ class _DeepICBase(nn.Module):
                 lower_bound=lower_bound,
                 upper_bound=upper_bound,
                 decode_type="sample",
+                max_decode_steps=self._top_k,
             )
 
             ranking = out["ranking"]
@@ -569,6 +573,7 @@ class _DeepICBase(nn.Module):
                     lower_bound=lower_bound,
                     upper_bound=upper_bound,
                     decode_type="greedy",
+                    max_decode_steps=self._top_k,
                 )
 
                 ranking = out["ranking"]
@@ -628,6 +633,7 @@ class DeepIC(_DeepICBase):
         progress: torch.Tensor,
         target_ranking: torch.Tensor | None = None,
         decode_type: str = "greedy",
+        max_decode_steps: int | None = None,
     ) -> dict[str, torch.Tensor]:
         bsz, n_sur, hidden_dim = H_surr.shape
         dtype = H_surr.dtype
@@ -637,8 +643,13 @@ class DeepIC(_DeepICBase):
         selected_mask = torch.zeros(bsz, n_sur, dtype=torch.bool, device=H_surr.device)
         logits_steps = []
         ranking_steps = []
+        decode_steps = n_sur
+        if max_decode_steps is not None:
+            decode_steps = min(int(max_decode_steps), n_sur)
+        if target_ranking is not None:
+            decode_steps = min(decode_steps, target_ranking.size(1))
 
-        for step in range(n_sur):
+        for step in range(decode_steps):
             remaining_ratio = (1.0 - progress) * float(n_sur - step) / max(float(n_sur), 1.0)
             query_input = torch.cat([context, remaining_ratio.to(dtype=dtype)], dim=-1)
             query = self.query_projection(query_input).unsqueeze(1)
@@ -692,6 +703,7 @@ class Deepic2(_DeepICBase):
         progress: torch.Tensor,
         target_ranking: torch.Tensor | None = None,
         decode_type: str = "greedy",
+        max_decode_steps: int | None = None,
     ) -> dict[str, torch.Tensor]:
         logits = self.scoring_head(H_surr)
         if decode_type == "sample":
@@ -702,6 +714,8 @@ class Deepic2(_DeepICBase):
             ranking_scores = logits
 
         ranking = torch.argsort(ranking_scores, dim=-1, descending=True)
+        if max_decode_steps is not None:
+            ranking = ranking[:, : min(int(max_decode_steps), ranking.size(1))]
         return {
             "logits": logits,
             "ranking": ranking,

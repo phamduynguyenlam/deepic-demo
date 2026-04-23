@@ -372,6 +372,7 @@ def adapt_deepic(
             upper_bound=upper,
             target_ranking=ranking,
             decode_type="sample" if ranking is None else "greedy",
+            max_decode_steps=top_k,
         )
 
         if reward_tensor is not None and ranking is not None:
@@ -401,6 +402,7 @@ def infer_deepic_ranking(
     upper: float,
     progress: float,
     device: str,
+    top_k: int | None = None,
 ) -> np.ndarray:
     model.eval()
     with torch.no_grad():
@@ -414,6 +416,7 @@ def infer_deepic_ranking(
             lower_bound=lower,
             upper_bound=upper,
             decode_type="sample",  # Sample from learned probability distribution
+            max_decode_steps=top_k,
         )
     return out["ranking"][0].detach().cpu().numpy()
 
@@ -455,6 +458,7 @@ class DeepICSAEAAgent:
             upper=upper,
             progress=progress,
             device=self.device,
+            top_k=k,
         )
 
         self.last_offspring_sigma = offspring_sigma
@@ -731,6 +735,7 @@ def infer_zdt7(args, deepic=None):
             upper=problem.upper,
             progress=progress,
             device=args.device,
+            top_k=args.k_eval,
         )
 
         selected_idx = ranking[: args.k_eval]
@@ -881,6 +886,7 @@ def run_infer_zdt1(args, deepic=None, plot: bool = True, initial_archive_x: np.n
             upper=problem.upper,
             progress=progress,
             device=args.device,
+            top_k=args.k_eval,
         )
 
         selected_idx = ranking[: args.k_eval]
@@ -1065,6 +1071,7 @@ def train_deepic_zdt(args):
                     upper=problem.upper,
                     progress=progress,
                     device=args.device,
+                    top_k=args.k_eval,
                 )
 
                 selected_idx = ranking[: args.k_eval]
@@ -1196,6 +1203,7 @@ def train_deepic_zdt1(args):
                 upper=problem.upper,
                 progress=progress,
                 device=args.device,
+                top_k=args.k_eval,
             )
 
             selected_idx = ranking[: args.k_eval]
@@ -1411,6 +1419,7 @@ def main():
             upper=problem.upper,
             progress=progress_ratio,
             device=args.device,
+            top_k=args.k_eval,
         )
 
         selected_idx = deepic_ranking[: args.k_eval]

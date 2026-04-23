@@ -545,6 +545,7 @@ def train_zdt2_only(args):
                 upper=problem.upper,
                 progress=progress,
                 device=args.device,
+                top_k=args.k_eval,
             )
 
             selected_idx = ranking[: args.k_eval]
@@ -756,6 +757,7 @@ def run_deepic_problem(
             upper=problem.upper,
             progress=progress,
             device=args.device,
+            top_k=args.k_eval,
         )
 
         selected_idx = ranking[: args.k_eval]

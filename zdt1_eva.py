@@ -257,6 +257,7 @@ def train_deepic_multisource(args):
                         upper=problem.upper,
                         progress=progress,
                         device=args.device,
+                        top_k=args.k_eval,
                     )
 
                     selected_idx = ranking[: args.k_eval]
@@ -468,6 +469,7 @@ def run_saea_deepic_zdt1(args, deepic, plot: bool = True, initial_archive_x: np.
             upper=problem.upper,
             progress=progress,
             device=args.device,
+            top_k=args.k_eval,
         )
 
         selected_idx = ranking[: args.k_eval]
