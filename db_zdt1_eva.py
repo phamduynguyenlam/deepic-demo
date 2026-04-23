@@ -532,6 +532,7 @@ class DBSAEATaskEnv:
         return {
             "problem_name": self.problem_name,
             "dim": int(self.dim),
+            "episode_index": int(self.episode_index),
             "true_evals": int(self.true_evals),
             "a1_count": int(self.a1_count),
             "best_obj1": float(np.min(self.archive_y[:, 0])),
@@ -670,6 +671,7 @@ def train_db_multisource(args):
     epoch_mean_losses: list[float] = []
     epsilon = float(args.epsilon_start)
     update_count = 0
+    task_interact_counts: dict[str, int] = {task_name: int(args.start_epoch) for task_name in task_names}
 
     if args.start_epoch > 0:
         checkpoint_path = epoch_model_path(args.start_epoch)
@@ -702,9 +704,12 @@ def train_db_multisource(args):
             rollout_summaries = ray.get(rollout_futures)
 
             for summary in rollout_summaries:
+                task_name = str(summary.get("task_name"))
                 transition_count = int(summary.get("transition_count", 0))
                 reward_sum = float(summary.get("reward_sum", 0.0))
                 stats = summary.get("episode_stats", {})
+                task_interact_counts[task_name] = int(task_interact_counts.get(task_name, int(args.start_epoch))) + 1
+                global_interact_index = int(task_interact_counts[task_name])
                 total_transitions += transition_count
                 epoch_reward_sum += reward_sum
                 epoch_reward_count += transition_count
@@ -712,7 +717,8 @@ def train_db_multisource(args):
                 reward_records.append(
                     {
                         "epoch": epoch + 1,
-                        "task_name": summary.get("task_name"),
+                        "task_name": task_name,
+                        "task_interact_index": global_interact_index,
                         "problem": stats.get("problem_name"),
                         "dim": stats.get("dim"),
                         "transition_count": transition_count,
@@ -727,9 +733,12 @@ def train_db_multisource(args):
                 )
                 if stats:
                     print(
-                        f"{stats['problem_name']}-{stats['dim']}D epoch {epoch + 1} done, "
+                        f"{stats['problem_name']}-{stats['dim']}D interact #{global_interact_index} "
+                        f"epoch {epoch + 1} done, "
                         f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
-                        f"eps={epsilon:.4f}, best_obj1={stats['best_obj1']:.6f}"
+                        f"eps={epsilon:.4f}, reward_sum={reward_sum:.6f}, "
+                        f"reward_mean={reward_sum / max(transition_count, 1):.6f}, "
+                        f"best_obj1={stats['best_obj1']:.6f}"
                     )
 
         mean_worker_reward = float(np.mean(worker_reward_sums)) if worker_reward_sums else 0.0
