@@ -100,6 +100,20 @@ def _all_task_names() -> list[str]:
     return [_task_name(problem_name, dim) for dim in SOURCE_DIMS for problem_name in SOURCE_PROBLEMS]
 
 
+def _ensure_worker_surrogates_ready(args) -> None:
+    loader_args = _build_args_namespace(args)
+    task_names = _all_task_names()
+    total_tasks = len(task_names)
+    print(f"Preparing KAN surrogates for {total_tasks} worker tasks before starting Ray workers...")
+    for task_idx, task_name in enumerate(task_names, start=1):
+        problem_name, dim = _parse_task_name(task_name)
+        checkpoint_path = multisource._kan_checkpoint_path(problem_name, dim)
+        status = "loading" if checkpoint_path.exists() else "pre-training"
+        print(f"[{task_idx:02d}/{total_tasks:02d}] {status} surrogate for {problem_name}-{dim}D")
+        multisource.load_or_prepare_kan_surrogate(problem_name, dim, loader_args)
+    print("All worker surrogates are ready.")
+
+
 def _archive_hv(values: np.ndarray, ref_point: np.ndarray) -> float:
     fronts, _ = demo.fast_non_dominated_sort(values)
     if not fronts or not fronts[0]:
@@ -615,6 +629,7 @@ def train_db_multisource(args):
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | reward_lambda={args.reward_lambda:.4f} | "
         f"max_fe={args.max_fe} | max_a1_actions={args.max_a1_actions}"
     )
+    _ensure_worker_surrogates_ready(args)
     if ray is None:
         raise ImportError("Ray is not installed. Install ray to train DB-SAEA with 24 parallel environments.")
     if not ray.is_initialized():
