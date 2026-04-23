@@ -636,9 +636,12 @@ def train_db_multisource(args):
         ray.init(ignore_reinit_error=True)
 
     task_names = _all_task_names()
-    num_workers = len(task_names)
+    num_workers = max(1, min(int(args.num_workers), len(task_names)))
     rollout_steps = int(args.max_a1_actions + max(args.max_fe - args.archive_size, 0))
-    print(f"Distributed training | num_workers={num_workers} | task_count={len(task_names)} | rollout_steps={rollout_steps}")
+    print(
+        f"Distributed training | num_workers={num_workers} | "
+        f"task_count={len(task_names)} | rollout_steps={rollout_steps}"
+    )
 
     replay_actor_cls = build_global_replay_buffer_actor()
     worker_actor_cls = build_db_saea_rollout_worker(policy_kwargs=_policy_kwargs(args))
@@ -650,7 +653,6 @@ def train_db_multisource(args):
     workers = [
         worker_actor_cls.remote(
             worker_id=idx,
-            task_name=task_names[idx],
             env_factory=env_factory,
             replay_buffer=replay,
         )
@@ -685,47 +687,50 @@ def train_db_multisource(args):
         epoch_losses: list[float] = []
         worker_reward_sums: list[float] = []
         current_weights = learner.state_dict_cpu()
-        rollout_futures = [
-            worker.collect_trajectories.remote(
-                weights=current_weights,
-                epsilon=epsilon,
-                max_steps=rollout_steps,
-            )
-            for worker in workers
-        ]
-        rollout_summaries = ray.get(rollout_futures)
-
         total_transitions = 0
-        for summary in rollout_summaries:
-            transition_count = int(summary.get("transition_count", 0))
-            reward_sum = float(summary.get("reward_sum", 0.0))
-            stats = summary.get("episode_stats", {})
-            total_transitions += transition_count
-            epoch_reward_sum += reward_sum
-            epoch_reward_count += transition_count
-            worker_reward_sums.append(reward_sum)
-            reward_records.append(
-                {
-                    "epoch": epoch + 1,
-                    "task_name": summary.get("task_name"),
-                    "problem": stats.get("problem_name"),
-                    "dim": stats.get("dim"),
-                    "transition_count": transition_count,
-                    "reward_sum": reward_sum,
-                    "reward_mean": reward_sum / max(transition_count, 1),
-                    "true_evals": stats.get("true_evals"),
-                    "a1_count": stats.get("a1_count"),
-                    "best_obj1": stats.get("best_obj1"),
-                    "step_count": stats.get("step_count"),
-                    "epsilon": float(epsilon),
-                }
-            )
-            if stats:
-                print(
-                    f"{stats['problem_name']}-{stats['dim']}D epoch {epoch + 1} done, "
-                    f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
-                    f"eps={epsilon:.4f}, best_obj1={stats['best_obj1']:.6f}"
+        for batch_start in range(0, len(task_names), num_workers):
+            task_batch = task_names[batch_start : batch_start + num_workers]
+            rollout_futures = [
+                workers[slot].collect_trajectories.remote(
+                    weights=current_weights,
+                    epsilon=epsilon,
+                    max_steps=rollout_steps,
+                    task_name=task_name,
                 )
+                for slot, task_name in enumerate(task_batch)
+            ]
+            rollout_summaries = ray.get(rollout_futures)
+
+            for summary in rollout_summaries:
+                transition_count = int(summary.get("transition_count", 0))
+                reward_sum = float(summary.get("reward_sum", 0.0))
+                stats = summary.get("episode_stats", {})
+                total_transitions += transition_count
+                epoch_reward_sum += reward_sum
+                epoch_reward_count += transition_count
+                worker_reward_sums.append(reward_sum)
+                reward_records.append(
+                    {
+                        "epoch": epoch + 1,
+                        "task_name": summary.get("task_name"),
+                        "problem": stats.get("problem_name"),
+                        "dim": stats.get("dim"),
+                        "transition_count": transition_count,
+                        "reward_sum": reward_sum,
+                        "reward_mean": reward_sum / max(transition_count, 1),
+                        "true_evals": stats.get("true_evals"),
+                        "a1_count": stats.get("a1_count"),
+                        "best_obj1": stats.get("best_obj1"),
+                        "step_count": stats.get("step_count"),
+                        "epsilon": float(epsilon),
+                    }
+                )
+                if stats:
+                    print(
+                        f"{stats['problem_name']}-{stats['dim']}D epoch {epoch + 1} done, "
+                        f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
+                        f"eps={epsilon:.4f}, best_obj1={stats['best_obj1']:.6f}"
+                    )
 
         mean_worker_reward = float(np.mean(worker_reward_sums)) if worker_reward_sums else 0.0
         print(
@@ -1038,6 +1043,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--dim", type=int, default=30)
+    parser.add_argument("--num_workers", type=int, default=24)
     parser.add_argument("--train_epochs", type=int, default=50)
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--train_only", action="store_true")

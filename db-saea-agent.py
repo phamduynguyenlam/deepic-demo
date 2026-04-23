@@ -598,10 +598,11 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
 
     @ray.remote(num_cpus=1)
     class DBSAEARolloutWorker:
-        def __init__(self, worker_id: int, task_name: str, env_factory, replay_buffer):
+        def __init__(self, worker_id: int, env_factory, replay_buffer):
             self.worker_id = worker_id
-            self.task_name = task_name
-            self.env = env_factory(task_name, worker_id)
+            self.task_name = None
+            self.env = None
+            self.env_factory = env_factory
             self.replay_buffer = replay_buffer
             self.local_policy = DBSAEAMetaPolicy(**policy_kwargs).cpu()
             self.local_policy.eval()
@@ -614,8 +615,14 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
             weights: dict[str, Any],
             epsilon: float,
             max_steps: int = 50,
+            task_name: str | None = None,
         ) -> int:
             self.sync_weights(weights)
+            if task_name is not None and task_name != self.task_name:
+                self.task_name = task_name
+                self.env = self.env_factory(task_name, self.worker_id)
+            if self.env is None or self.task_name is None:
+                raise ValueError("collect_trajectories requires a task_name before rollout.")
             transitions: list[dict[str, Any]] = []
             state = self.env.reset()
 
