@@ -412,6 +412,10 @@ def _write_infer_notebook(notebook_path: Path, result_json_path: Path) -> None:
 
 def train_db_multisource(args):
     demo.set_seed(args.seed)
+    print(
+        f"Training config | dqn_lr={args.dqn_lr:.1e} | "
+        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | reward_lambda={args.reward_lambda:.4f}"
+    )
     replay = GlobalReplayBuffer(capacity=args.replay_capacity)
     learner = DistributedLearner(
         policy=DBSAEAMetaPolicy(**_policy_kwargs(args)),

@@ -380,6 +380,10 @@ def _update_deepic_from_episode(
 
 def train_deepic_multisource(args, target_problem: str, self_train_only: bool = False):
     demo.set_seed(args.seed)
+    print(
+        f"Training config | deepic_lr={args.deepic_lr:.1e} | "
+        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f}"
+    )
     pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
     epoch_mean_rewards: list[float] = []
