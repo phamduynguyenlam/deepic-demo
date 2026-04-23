@@ -184,7 +184,7 @@ def _run_baseline_nsga_eic(args, initial_archive_x: np.ndarray):
 
 def _run_baseline_saea_deepic_zdt1(args, initial_archive_x: np.ndarray):
     baseline_args = SimpleNamespace(**vars(args))
-    baseline_args.k_eval = 4
+    baseline_args.k_eval = 1
     baseline_args.eval_epoch = getattr(args, "eval_epoch", None)
     baseline_args.deepic_hidden = getattr(args, "deepic_hidden", 64)
     baseline_args.deepic_heads = getattr(args, "deepic_heads", 4)
