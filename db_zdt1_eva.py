@@ -28,6 +28,9 @@ niching_nsga = load_module("niching_nsga.py", "niching_nsga_module")
 DBSAEAMetaPolicy = db_saea_agent.DBSAEAMetaPolicy
 GlobalReplayBuffer = db_saea_agent.GlobalReplayBuffer
 DistributedLearner = db_saea_agent.DistributedLearner
+ray = db_saea_agent.ray
+build_global_replay_buffer_actor = db_saea_agent.build_global_replay_buffer_actor
+build_db_saea_rollout_worker = db_saea_agent.build_db_saea_rollout_worker
 
 
 SOURCE_PROBLEMS = ["ZDT2", "ZDT3", "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTLZ6", "DTLZ7"]
@@ -82,6 +85,19 @@ def _build_args_namespace(parsed) -> SimpleNamespace:
         seed=parsed.seed,
         device=parsed.device,
     )
+
+
+def _task_name(problem_name: str, dim: int) -> str:
+    return f"{problem_name}|{int(dim)}"
+
+
+def _parse_task_name(task_name: str) -> tuple[str, int]:
+    problem_name, dim = task_name.split("|", maxsplit=1)
+    return problem_name, int(dim)
+
+
+def _all_task_names() -> list[str]:
+    return [_task_name(problem_name, dim) for dim in SOURCE_DIMS for problem_name in SOURCE_PROBLEMS]
 
 
 def _archive_hv(values: np.ndarray, ref_point: np.ndarray) -> float:
@@ -341,6 +357,174 @@ def _next_state_after_transition(problem, surrogates, archive_x: np.ndarray, arc
     return state, offspring_x, offspring_pred, offspring_sigma
 
 
+class DBSAEATaskEnv:
+    def __init__(self, task_name: str, worker_id: int, args):
+        self.task_name = task_name
+        self.worker_id = int(worker_id)
+        self.args = args
+        self.problem_name, self.dim = _parse_task_name(task_name)
+        entry = multisource.load_or_prepare_kan_surrogate(self.problem_name, self.dim, _build_args_namespace(args))
+        self.problem = entry["problem"]
+        self.base_surrogates = entry["models"]
+        self.pretrain_x = np.asarray(entry["x"], dtype=np.float32)
+        self.pretrain_y = np.asarray(entry["y"], dtype=np.float32)
+        self.ref_point = nsga_eic._reference_point(self.problem_name, self.dim)
+        self.episode_index = 0
+        self.archive_x = None
+        self.archive_y = None
+        self.surrogates = None
+        self.true_evals = 0
+        self.step_count = 0
+        self.a1_count = 0
+        self.state = None
+        self.offspring_x = None
+        self.offspring_pred = None
+        self.offspring_sigma = None
+
+    def _initial_seed(self) -> int:
+        return (
+            int(self.args.seed)
+            + self.episode_index * 10000
+            + self.worker_id * 1000
+            + self.dim * 100
+            + sum(ord(ch) for ch in self.problem_name)
+        )
+
+    def reset(self) -> dict:
+        self.episode_index += 1
+        self.archive_x = multisource.latin_hypercube_sample(
+            lower=self.problem.lower,
+            upper=self.problem.upper,
+            n_samples=self.args.archive_size,
+            dim=self.dim,
+            seed=self._initial_seed(),
+        )
+        self.archive_y = self.problem.evaluate(self.archive_x)
+        self.surrogates = self.base_surrogates
+        self.true_evals = int(self.args.archive_size)
+        self.step_count = 0
+        self.a1_count = 0
+        self.state, self.offspring_x, self.offspring_pred, self.offspring_sigma = _next_state_after_transition(
+            problem=self.problem,
+            surrogates=self.surrogates,
+            archive_x=self.archive_x,
+            archive_y=self.archive_y,
+            true_evals=self.true_evals,
+            args=self.args,
+        )
+        return self.state
+
+    def select_action(self, policy, state: dict, epsilon: float) -> int:
+        policy_state = _policy_inputs_from_state(state, device="cpu")
+        return _select_action_with_a1_cap(
+            policy=policy,
+            policy_state=policy_state,
+            epsilon=float(epsilon),
+            a1_count=self.a1_count,
+            max_a1_actions=self.args.max_a1_actions,
+        )
+
+    def step(self, action: int):
+        self.step_count += 1
+        action = int(action)
+        if action == 0:
+            self.a1_count += 1
+            reward_value = 0.0
+            archive_x_next = self.archive_x
+            archive_y_next = self.archive_y
+            true_evals_next = self.true_evals
+            done = False
+            surrogates_next = self.surrogates
+            next_state, next_offspring_x, next_offspring_pred, next_offspring_sigma = _next_state_after_transition(
+                problem=self.problem,
+                surrogates=surrogates_next,
+                archive_x=archive_x_next,
+                archive_y=archive_y_next,
+                true_evals=true_evals_next,
+                args=self.args,
+            )
+        else:
+            ranking = _ranking_for_action(
+                action=action,
+                archive_y=self.archive_y,
+                offspring_pred=self.offspring_pred,
+                offspring_sigma=self.offspring_sigma,
+                seed=int(self.args.seed) + self.episode_index * 100000 + self.dim * 1000 + self.step_count,
+            )
+            selected_idx = ranking[: self.args.k_eval]
+            selected_x = self.offspring_x[selected_idx]
+            selected_y = self.problem.evaluate(selected_x)
+            reward_value = _db_saea_reward(
+                previous_archive=self.archive_y,
+                selected_y=selected_y,
+                ref_point=self.ref_point,
+                reward_lambda=self.args.reward_lambda,
+                epsilon=self.args.hv_epsilon,
+            )
+            archive_x_next, archive_y_next = demo.update_archive(
+                archive_x=self.archive_x,
+                archive_y=self.archive_y,
+                new_x=selected_x,
+                new_y=selected_y,
+            )
+            true_evals_next = self.true_evals + self.args.k_eval
+            done = bool(true_evals_next >= self.args.max_fe)
+            if not done:
+                combined_x = np.vstack([self.pretrain_x, archive_x_next])
+                combined_y = np.vstack([self.pretrain_y, archive_y_next])
+                surrogates_next = demo.fit_kan_surrogates(
+                    archive_x=combined_x,
+                    archive_y=combined_y,
+                    device=self.args.device,
+                    kan_steps=self.args.kan_steps,
+                    hidden_width=self.args.kan_hidden,
+                    grid=self.args.kan_grid,
+                    seed=int(self.args.seed) + self.episode_index * 10000 + self.step_count * 100 + self.dim,
+                )
+                next_state, next_offspring_x, next_offspring_pred, next_offspring_sigma = _next_state_after_transition(
+                    problem=self.problem,
+                    surrogates=surrogates_next,
+                    archive_x=archive_x_next,
+                    archive_y=archive_y_next,
+                    true_evals=true_evals_next,
+                    args=self.args,
+                )
+            else:
+                surrogates_next = self.surrogates
+                next_state = self.state
+                next_offspring_x = self.offspring_x
+                next_offspring_pred = self.offspring_pred
+                next_offspring_sigma = self.offspring_sigma
+
+        self.archive_x = archive_x_next
+        self.archive_y = archive_y_next
+        self.surrogates = surrogates_next
+        self.true_evals = true_evals_next
+        self.state = next_state
+        self.offspring_x = next_offspring_x
+        self.offspring_pred = next_offspring_pred
+        self.offspring_sigma = next_offspring_sigma
+        info = {
+            "executed_action": action,
+            "problem_name": self.problem_name,
+            "dim": int(self.dim),
+            "true_evals": int(self.true_evals),
+            "a1_count": int(self.a1_count),
+            "best_obj1": float(np.min(self.archive_y[:, 0])),
+        }
+        return next_state, float(reward_value), bool(done), info
+
+    def episode_stats(self) -> dict:
+        return {
+            "problem_name": self.problem_name,
+            "dim": int(self.dim),
+            "true_evals": int(self.true_evals),
+            "a1_count": int(self.a1_count),
+            "best_obj1": float(np.min(self.archive_y[:, 0])),
+            "step_count": int(self.step_count),
+        }
+
+
 def _write_infer_notebook(notebook_path: Path, result_json_path: Path) -> None:
     notebook = {
         "cells": [
@@ -431,7 +615,33 @@ def train_db_multisource(args):
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | reward_lambda={args.reward_lambda:.4f} | "
         f"max_fe={args.max_fe} | max_a1_actions={args.max_a1_actions}"
     )
-    replay = GlobalReplayBuffer(capacity=args.replay_capacity)
+    if ray is None:
+        raise ImportError("Ray is not installed. Install ray to train DB-SAEA with 24 parallel environments.")
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+
+    task_names = _all_task_names()
+    num_workers = len(task_names)
+    rollout_steps = int(args.max_a1_actions + max(args.max_fe - args.archive_size, 0))
+    print(f"Distributed training | num_workers={num_workers} | task_count={len(task_names)} | rollout_steps={rollout_steps}")
+
+    replay_actor_cls = build_global_replay_buffer_actor()
+    worker_actor_cls = build_db_saea_rollout_worker(policy_kwargs=_policy_kwargs(args))
+    replay = replay_actor_cls.remote(capacity=args.replay_capacity)
+
+    def env_factory(task_name: str, worker_id: int):
+        return DBSAEATaskEnv(task_name=task_name, worker_id=worker_id, args=args)
+
+    workers = [
+        worker_actor_cls.remote(
+            worker_id=idx,
+            task_name=task_names[idx],
+            env_factory=env_factory,
+            replay_buffer=replay,
+        )
+        for idx in range(num_workers)
+    ]
+
     learner = DistributedLearner(
         policy=DBSAEAMetaPolicy(**_policy_kwargs(args)),
         device=args.device,
@@ -455,169 +665,63 @@ def train_db_multisource(args):
 
     for epoch in range(args.start_epoch, args.train_epochs):
         print(f"Epoch {epoch + 1}/{args.train_epochs}")
-        epoch_rewards: list[float] = []
+        epoch_reward_sum = 0.0
+        epoch_reward_count = 0
         epoch_losses: list[float] = []
+        current_weights = learner.state_dict_cpu()
+        rollout_futures = [
+            worker.collect_trajectories.remote(
+                weights=current_weights,
+                epsilon=epsilon,
+                max_steps=rollout_steps,
+            )
+            for worker in workers
+        ]
+        rollout_summaries = ray.get(rollout_futures)
 
-        for dim in SOURCE_DIMS:
-            for problem_name in SOURCE_PROBLEMS:
-                entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, _build_args_namespace(args))
-                problem = entry["problem"]
-                surrogates = entry["models"]
-                pretrain_x = np.asarray(entry["x"], dtype=np.float32)
-                pretrain_y = np.asarray(entry["y"], dtype=np.float32)
-                ref_point = nsga_eic._reference_point(problem_name, dim)
-
-                archive_x = multisource.latin_hypercube_sample(
-                    lower=problem.lower,
-                    upper=problem.upper,
-                    n_samples=args.archive_size,
-                    dim=dim,
-                    seed=args.seed + epoch * 10000 + dim * 100 + sum(ord(ch) for ch in problem_name),
-                )
-                archive_y = problem.evaluate(archive_x)
-                true_evals = args.archive_size
-                step = 0
-                a1_count = 0
-
-                state, offspring_x, offspring_pred, offspring_sigma = _next_state_after_transition(
-                    problem=problem,
-                    surrogates=surrogates,
-                    archive_x=archive_x,
-                    archive_y=archive_y,
-                    true_evals=true_evals,
-                    args=args,
-                )
-
-                while true_evals < args.max_fe:
-                    step += 1
-                    policy_state = _policy_inputs_from_state(state, args.device)
-                    action = _select_action_with_a1_cap(
-                        policy=learner.global_policy,
-                        policy_state=policy_state,
-                        epsilon=epsilon,
-                        a1_count=a1_count,
-                        max_a1_actions=args.max_a1_actions,
-                    )
-                    if action == 0:
-                        a1_count += 1
-                        reward_value = 0.0
-                        archive_x_next = archive_x
-                        archive_y_next = archive_y
-                        true_evals_next = true_evals
-                        done = False
-                        surrogates_next = surrogates
-                        next_state, next_offspring_x, next_offspring_pred, next_offspring_sigma = _next_state_after_transition(
-                            problem=problem,
-                            surrogates=surrogates_next,
-                            archive_x=archive_x_next,
-                            archive_y=archive_y_next,
-                            true_evals=true_evals_next,
-                            args=args,
-                        )
-                    else:
-                        ranking = _ranking_for_action(
-                            action=action,
-                            archive_y=archive_y,
-                            offspring_pred=offspring_pred,
-                            offspring_sigma=offspring_sigma,
-                            seed=args.seed + epoch * 100000 + dim * 1000 + step,
-                        )
-                        selected_idx = ranking[: args.k_eval]
-                        selected_x = offspring_x[selected_idx]
-                        selected_y = problem.evaluate(selected_x)
-                        reward_value = _db_saea_reward(
-                            previous_archive=archive_y,
-                            selected_y=selected_y,
-                            ref_point=ref_point,
-                            reward_lambda=args.reward_lambda,
-                            epsilon=args.hv_epsilon,
-                        )
-
-                        archive_x_next, archive_y_next = demo.update_archive(
-                            archive_x=archive_x,
-                            archive_y=archive_y,
-                            new_x=selected_x,
-                            new_y=selected_y,
-                        )
-
-                        true_evals_next = true_evals + args.k_eval
-                        done = bool(true_evals_next >= args.max_fe)
-                        if not done:
-                            combined_x = np.vstack([pretrain_x, archive_x_next])
-                            combined_y = np.vstack([pretrain_y, archive_y_next])
-                            surrogates_next = demo.fit_kan_surrogates(
-                                archive_x=combined_x,
-                                archive_y=combined_y,
-                                device=args.device,
-                                kan_steps=args.kan_steps,
-                                hidden_width=args.kan_hidden,
-                                grid=args.kan_grid,
-                                seed=args.seed + epoch * 10000 + step * 100 + dim,
-                            )
-                            next_state, next_offspring_x, next_offspring_pred, next_offspring_sigma = _next_state_after_transition(
-                                problem=problem,
-                                surrogates=surrogates_next,
-                                archive_x=archive_x_next,
-                                archive_y=archive_y_next,
-                                true_evals=true_evals_next,
-                                args=args,
-                            )
-                        else:
-                            surrogates_next = surrogates
-                            next_state = state
-                            next_offspring_x, next_offspring_pred, next_offspring_sigma = offspring_x, offspring_pred, offspring_sigma
-
-                    replay.add(
-                        [
-                            {
-                                "state": state,
-                                "action": int(action),
-                                "reward": float(reward_value),
-                                "next_state": next_state,
-                                "done": done,
-                            }
-                        ]
-                    )
-                    batch = replay.sample(args.batch_size)
-                    loss_value = learner.update_model(batch=batch, gamma=args.gamma, grad_clip=args.grad_clip)
-                    if batch:
-                        epoch_losses.append(float(loss_value))
-                        update_count += 1
-                        if update_count % args.target_update_interval == 0:
-                            learner.load_target_from_online()
-
-                    epoch_rewards.append(float(reward_value))
-                    reward_records.append(
-                        {
-                            "epoch": epoch + 1,
-                            "problem": problem_name,
-                            "dim": int(dim),
-                            "step": step,
-                            "action": int(action),
-                            "action_name": ACTION_NAMES[int(action)],
-                            "reward": float(reward_value),
-                            "progress": float(state["progress"]),
-                            "loss": float(loss_value),
-                            "epsilon": float(epsilon),
-                        }
-                    )
-
-                    archive_x, archive_y = archive_x_next, archive_y_next
-                    surrogates = surrogates_next
-                    true_evals = true_evals_next
-                    state = next_state
-                    offspring_x, offspring_pred, offspring_sigma = next_offspring_x, next_offspring_pred, next_offspring_sigma
-
-                    if done:
-                        break
-
-                epsilon = max(float(args.epsilon_end), float(epsilon) * float(args.epsilon_decay))
+        total_transitions = 0
+        for summary in rollout_summaries:
+            transition_count = int(summary.get("transition_count", 0))
+            reward_sum = float(summary.get("reward_sum", 0.0))
+            stats = summary.get("episode_stats", {})
+            total_transitions += transition_count
+            epoch_reward_sum += reward_sum
+            epoch_reward_count += transition_count
+            reward_records.append(
+                {
+                    "epoch": epoch + 1,
+                    "task_name": summary.get("task_name"),
+                    "problem": stats.get("problem_name"),
+                    "dim": stats.get("dim"),
+                    "transition_count": transition_count,
+                    "reward_sum": reward_sum,
+                    "reward_mean": reward_sum / max(transition_count, 1),
+                    "true_evals": stats.get("true_evals"),
+                    "a1_count": stats.get("a1_count"),
+                    "best_obj1": stats.get("best_obj1"),
+                    "step_count": stats.get("step_count"),
+                    "epsilon": float(epsilon),
+                }
+            )
+            if stats:
                 print(
-                    f"{problem_name}-{dim}D epoch {epoch + 1} done, "
-                    f"true_evals={true_evals}, a1_count={a1_count}, eps={epsilon:.4f}, best_obj1={np.min(archive_y[:, 0]):.6f}"
+                    f"{stats['problem_name']}-{stats['dim']}D epoch {epoch + 1} done, "
+                    f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
+                    f"eps={epsilon:.4f}, best_obj1={stats['best_obj1']:.6f}"
                 )
 
-        mean_reward = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
+        updates_this_epoch = max(1, total_transitions // max(int(args.batch_size), 1))
+        for _ in range(updates_this_epoch):
+            batch = ray.get(replay.sample.remote(args.batch_size))
+            loss_value = learner.update_model(batch=batch, gamma=args.gamma, grad_clip=args.grad_clip)
+            if batch:
+                epoch_losses.append(float(loss_value))
+                update_count += 1
+                if update_count % args.target_update_interval == 0:
+                    learner.load_target_from_online()
+
+        epsilon = max(float(args.epsilon_end), float(epsilon) * float(args.epsilon_decay))
+        mean_reward = float(epoch_reward_sum / max(epoch_reward_count, 1))
         mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
         epoch_mean_rewards.append(mean_reward)
         epoch_mean_losses.append(mean_loss)
@@ -636,10 +740,12 @@ def train_db_multisource(args):
         TRAIN_LOG_PATH,
         {
             "script": "db_zdt1_eva.py",
-            "mode": "train_db_multisource",
+            "mode": "train_db_multisource_distributed",
             "model_path": MODEL_PATH,
             "source_problems": SOURCE_PROBLEMS,
             "source_dims": SOURCE_DIMS,
+            "task_names": task_names,
+            "num_workers": num_workers,
             "action_names": ACTION_NAMES,
             "epoch_mean_rewards": epoch_mean_rewards,
             "epoch_mean_losses": epoch_mean_losses,

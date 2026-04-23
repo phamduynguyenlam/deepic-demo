@@ -620,23 +620,31 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
             state = self.env.reset()
 
             for _ in range(max_steps):
-                action = self.local_policy.select_action(
-                    x_true=state["x_true"],
-                    y_true=state["y_true"],
-                    x_sur=state["x_sur"],
-                    y_sur=state["y_sur"],
-                    sigma_sur=state["sigma_sur"],
-                    lower_bound=state["lower_bound"],
-                    upper_bound=state["upper_bound"],
-                    progress=state["progress"],
-                    epsilon=epsilon,
-                )
+                if hasattr(self.env, "select_action"):
+                    action = self.env.select_action(
+                        policy=self.local_policy,
+                        state=state,
+                        epsilon=epsilon,
+                    )
+                else:
+                    action = self.local_policy.select_action(
+                        x_true=state["x_true"],
+                        y_true=state["y_true"],
+                        x_sur=state["x_sur"],
+                        y_sur=state["y_sur"],
+                        sigma_sur=state["sigma_sur"],
+                        lower_bound=state["lower_bound"],
+                        upper_bound=state["upper_bound"],
+                        progress=state["progress"],
+                        epsilon=epsilon,
+                    )
 
-                next_state, reward, done, _ = self.env.step(action)
+                next_state, reward, done, info = self.env.step(action)
+                executed_action = int(info.get("executed_action", action)) if isinstance(info, dict) else int(action)
                 transitions.append(
                     {
                         "state": _clone_state_for_buffer(state),
-                        "action": int(action),
+                        "action": executed_action,
                         "reward": float(reward),
                         "next_state": _clone_state_for_buffer(next_state),
                         "done": bool(done),
@@ -649,7 +657,14 @@ def build_db_saea_rollout_worker(policy_kwargs: dict[str, Any] | None = None):
 
             if transitions:
                 self.replay_buffer.add.remote(transitions)
-            return len(transitions)
+            summary = {
+                "transition_count": len(transitions),
+                "reward_sum": float(sum(item["reward"] for item in transitions)),
+                "task_name": self.task_name,
+            }
+            if hasattr(self.env, "episode_stats"):
+                summary["episode_stats"] = self.env.episode_stats()
+            return summary
 
     return DBSAEARolloutWorker
 
@@ -729,7 +744,13 @@ def train_db_saea_distributed(
             )
             for worker in workers
         ]
-        rollout_counts = ray.get(rollout_futures)
+        rollout_summaries = ray.get(rollout_futures)
+        rollout_transitions = 0
+        for item in rollout_summaries:
+            if isinstance(item, dict):
+                rollout_transitions += int(item.get("transition_count", 0))
+            else:
+                rollout_transitions += int(item)
 
         batch = ray.get(replay_buffer.sample.remote(batch_size))
         loss = learner.update_model(batch=batch, gamma=gamma, grad_clip=grad_clip)
@@ -745,7 +766,7 @@ def train_db_saea_distributed(
                 "loss": float(loss),
                 "epsilon": float(epsilon),
                 "buffer_size": float(buffer_size),
-                "rollout_transitions": float(sum(rollout_counts)),
+                "rollout_transitions": float(rollout_transitions),
             }
         )
 
