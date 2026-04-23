@@ -668,6 +668,7 @@ def train_db_multisource(args):
         epoch_reward_sum = 0.0
         epoch_reward_count = 0
         epoch_losses: list[float] = []
+        worker_reward_sums: list[float] = []
         current_weights = learner.state_dict_cpu()
         rollout_futures = [
             worker.collect_trajectories.remote(
@@ -687,6 +688,7 @@ def train_db_multisource(args):
             total_transitions += transition_count
             epoch_reward_sum += reward_sum
             epoch_reward_count += transition_count
+            worker_reward_sums.append(reward_sum)
             reward_records.append(
                 {
                     "epoch": epoch + 1,
@@ -709,6 +711,12 @@ def train_db_multisource(args):
                     f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
                     f"eps={epsilon:.4f}, best_obj1={stats['best_obj1']:.6f}"
                 )
+
+        mean_worker_reward = float(np.mean(worker_reward_sums)) if worker_reward_sums else 0.0
+        print(
+            f"Epoch {epoch + 1} rollout done | "
+            f"workers={len(worker_reward_sums)} | mean_worker_reward={mean_worker_reward:.6f}"
+        )
 
         updates_this_epoch = max(1, total_transitions // max(int(args.batch_size), 1))
         for _ in range(updates_this_epoch):
