@@ -170,6 +170,10 @@ def _fit_surrogates_with_pretrain(problem, args):
     return pretrain_x, pretrain_y, surrogates
 
 
+def _true_eval_axis(hv_history: list[float], evals_per_step: int) -> np.ndarray:
+    return (np.arange(len(hv_history), dtype=np.int64) * int(evals_per_step)).astype(np.int64)
+
+
 def _run_baseline_nsga_eic(args, initial_archive_x: np.ndarray):
     baseline_args = SimpleNamespace(**vars(args))
     baseline_args.k_eval = 4
@@ -322,10 +326,11 @@ def run_niching_nsga(args, plot: bool = True, initial_archive_x: np.ndarray | No
     true_front = nsga_eic._true_front(args.problem)
 
     if plot:
+        eval_axis = _true_eval_axis(hv_history, k_eval_total)
         plt.figure(figsize=(8, 5))
         plt.title(f"{args.problem} Hypervolume Progress")
-        plt.plot(hv_history, marker="o", label="Niching-NSGA")
-        plt.xlabel("Step")
+        plt.plot(eval_axis, hv_history, marker="o", label="Niching-NSGA")
+        plt.xlabel("Additional True Evaluations")
         plt.ylabel("Hypervolume")
         plt.grid(True)
         plt.legend()
@@ -368,12 +373,16 @@ def run_comparison(args):
     print(f"SAEA-DeepIC(ZDT1-trained) final HV: {deepic_zdt1_result['hv_history'][-1]:.6f}")
     print(f"Reference point: {niching_result['ref_point']}")
 
+    niching_eval_axis = _true_eval_axis(niching_result["hv_history"], evals_per_step=4)
+    baseline_eval_axis = _true_eval_axis(baseline_result["hv_history"], evals_per_step=4)
+    deepic_eval_axis = _true_eval_axis(deepic_zdt1_result["hv_history"], evals_per_step=1)
+
     plt.figure(figsize=(8, 5))
     plt.title(f"{args.problem} Hypervolume Comparison")
-    plt.plot(niching_result["hv_history"], marker="o", label="Niching-NSGA")
-    plt.plot(baseline_result["hv_history"], marker="s", label="NSGA-EIC")
-    plt.plot(deepic_zdt1_result["hv_history"], marker="^", label="SAEA-DeepIC (ZDT1-trained)")
-    plt.xlabel("Step")
+    plt.plot(niching_eval_axis, niching_result["hv_history"], marker="o", label="Niching-NSGA")
+    plt.plot(baseline_eval_axis, baseline_result["hv_history"], marker="s", label="NSGA-EIC")
+    plt.plot(deepic_eval_axis, deepic_zdt1_result["hv_history"], marker="^", label="SAEA-DeepIC (ZDT1-trained)")
+    plt.xlabel("Additional True Evaluations")
     plt.ylabel("Hypervolume")
     plt.grid(True)
     plt.legend()

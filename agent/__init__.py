@@ -9,4 +9,4 @@ from .gleet_agent import GLEET_Agent
 
 
 from .Surr_RLDE_Agent import *
-from .deepic_agent import DeepIC, Deepic2, HV_DeepIC
+from .deepic_agent import DeepIC, Deepic2, HV_DeepIC, SimplifiedDeepIC

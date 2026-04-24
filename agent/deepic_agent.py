@@ -724,6 +724,60 @@ class Deepic2(_DeepICBase):
         }
 
 
+class SimplifiedDeepIC(_DeepICBase):
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        n_heads: int = 8,
+        ff_dim: int = 256,
+        dropout: float = 0.0,
+    ):
+        super().__init__(hidden_dim=hidden_dim, n_heads=n_heads, ff_dim=ff_dim, dropout=dropout)
+        self.W_decode = nn.Parameter(torch.empty(hidden_dim))
+        nn.init.normal_(self.W_decode, mean=0.0, std=hidden_dim ** -0.5)
+
+    def decode_ranking(
+        self,
+        H_surr: torch.Tensor,
+        H_true: torch.Tensor,
+        progress: torch.Tensor,
+        target_ranking: torch.Tensor | None = None,
+        decode_type: str = "greedy",
+        max_decode_steps: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        logits = torch.einsum("bnh,h->bn", H_surr, self.W_decode)
+
+        if target_ranking is not None:
+            ranking = target_ranking
+        elif decode_type == "sample":
+            bsz, n_sur = logits.shape
+            ranking_steps = []
+            selected_mask = torch.zeros(bsz, n_sur, dtype=torch.bool, device=logits.device)
+            decode_steps = n_sur if max_decode_steps is None else min(int(max_decode_steps), n_sur)
+
+            for _ in range(decode_steps):
+                masked_logits = logits.masked_fill(selected_mask, -1e9)
+                chosen_idx = torch.distributions.Categorical(logits=masked_logits).sample()
+                ranking_steps.append(chosen_idx.unsqueeze(1))
+                selected_mask = selected_mask.scatter(1, chosen_idx.unsqueeze(1), True)
+
+            ranking = torch.cat(ranking_steps, dim=1)
+        else:
+            ranking = torch.argsort(logits, dim=-1, descending=True)
+            if max_decode_steps is not None:
+                ranking = ranking[:, : min(int(max_decode_steps), ranking.size(1))]
+
+        if target_ranking is not None and max_decode_steps is not None:
+            ranking = ranking[:, : min(int(max_decode_steps), ranking.size(1))]
+
+        return {
+            "logits": logits,
+            "ranking": ranking,
+            "H_surr": H_surr,
+            "H_true": H_true,
+        }
+
+
 class HV_DeepIC(DeepIC):
     """DeepIC variant that measures archive progress with hypervolume improvement."""
 
