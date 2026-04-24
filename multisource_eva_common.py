@@ -210,6 +210,45 @@ def training_problems_for(target_problem: str, self_train_only: bool = False) ->
     return source_problems_for(target_problem)
 
 
+def _compute_reward(
+    previous_front: np.ndarray,
+    selected_objectives: np.ndarray,
+    reward_scheme: int = 1,
+) -> float:
+    if int(reward_scheme) == 1:
+        return float(
+            demo.DeepICClass.fpareto_improvement_reward(
+                previous_front=previous_front,
+                selected_objectives=selected_objectives,
+            )
+        )
+
+    if int(reward_scheme) != 2:
+        raise ValueError(f"Unsupported reward_scheme: {reward_scheme}")
+
+    previous_front = demo.DeepICClass.pareto_front(np.asarray(previous_front, dtype=np.float32))
+    selected_objectives = np.asarray(selected_objectives, dtype=np.float32)
+
+    improved = False
+    for candidate in selected_objectives:
+        if not any(demo.DeepICClass._dominates(prev, candidate) for prev in previous_front):
+            improved = True
+            break
+
+    if not improved:
+        return 0.0
+
+    reward = 0.0
+    origin = np.zeros(previous_front.shape[1], dtype=np.float32)
+    for candidate in selected_objectives:
+        distances = np.abs(previous_front - candidate).sum(axis=1)
+        nearest_idx = int(np.argmin(distances))
+        d_i = float(distances[nearest_idx])
+        d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
+        reward += d_i / max(d_ref_i, 1e-12)
+    return float(reward)
+
+
 def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
     save_path = _kan_checkpoint_path(problem_name, dim)
 
@@ -579,7 +618,8 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
     demo.set_seed(args.seed)
     print(
         f"Training config | deepic_lr={args.deepic_lr:.1e} | "
-        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f}"
+        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
+        f"reward_scheme={getattr(args, 'reward_scheme', 1)}"
     )
     pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
@@ -669,9 +709,10 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                     selected_x = offspring_x[selected_idx]
                     selected_y = problem.evaluate(selected_x)
 
-                    reward = demo.DeepICClass.fpareto_improvement_reward(
+                    reward = _compute_reward(
                         previous_front=archive_y_t,
                         selected_objectives=selected_y,
+                        reward_scheme=int(getattr(args, "reward_scheme", 1)),
                     )
                     reward_value = float(reward)
                     epoch_rewards.append(reward_value)
@@ -759,6 +800,7 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
             "training_problems": training_problems_for(target_problem, self_train_only=self_train_only),
             "source_dims": SOURCE_DIMS,
             "training_label": _training_label(self_train_only),
+            "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "epoch_mean_rewards": epoch_mean_rewards,
             "records": reward_records,
         },
@@ -773,7 +815,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         f"Training config (PPO) | deepic_lr={args.deepic_lr:.1e} | "
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
         f"ppo_epochs={getattr(args, 'ppo_epochs', 4)} | "
-        f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f}"
+        f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f} | "
+        f"reward_scheme={getattr(args, 'reward_scheme', 1)}"
     )
     pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
@@ -886,9 +929,10 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                     selected_y = problem.evaluate(selected_x)
 
                     reward_value = float(
-                        demo.DeepICClass.fpareto_improvement_reward(
+                        _compute_reward(
                             previous_front=archive_y_t,
                             selected_objectives=selected_y,
+                            reward_scheme=int(getattr(args, "reward_scheme", 1)),
                         )
                     )
                     epoch_rewards.append(reward_value)
@@ -996,6 +1040,7 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
             "training_problems": training_problems_for(target_problem, self_train_only=self_train_only),
             "source_dims": SOURCE_DIMS,
             "training_label": _training_label(self_train_only),
+            "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "epoch_mean_rewards": epoch_mean_rewards,
             "epoch_mean_total_losses": epoch_mean_total_losses,
             "ppo_epochs": ppo_epochs,
@@ -1104,9 +1149,10 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         selected_x = offspring_x[selected_idx]
         selected_y = problem.evaluate(selected_x)
         reward_value = float(
-            demo.DeepICClass.fpareto_improvement_reward(
+            _compute_reward(
                 previous_front=archive_y,
                 selected_objectives=selected_y,
+                reward_scheme=int(getattr(args, "reward_scheme", 1)),
             )
         )
         reward_history.append(reward_value)
@@ -1254,6 +1300,13 @@ def parse_args(target_problem: str):
     parser.add_argument("--ppo_entropy_coef", type=float, default=0.01)
     parser.add_argument("--ppo_gae_lambda", type=float, default=0.95)
     parser.add_argument("--ppo_grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--reward_scheme",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Reward scheme: 1=original reward, 2=improve=>sum(d_i/d_ref), no-improve=>0.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--dim", type=int, default=30)
