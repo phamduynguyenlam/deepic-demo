@@ -186,6 +186,8 @@ def _normalized_hv_improvement_reward(
 
     previous_hv = _hypervolume(previous_archive, ref_point)
     next_hv = _hypervolume(combined_archive, ref_point)
+    if next_hv <= previous_hv:
+        return -1.0
     return float((next_hv - previous_hv) / (previous_hv + float(epsilon)))
 
 

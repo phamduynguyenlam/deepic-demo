@@ -387,7 +387,7 @@ class _DeepICBase(nn.Module):
                 break
 
         if not improved:
-            return 0.0
+            return -1.0
 
         reward = 1.0
         origin = np.zeros(previous_front.shape[1], dtype=np.float32)
@@ -685,45 +685,6 @@ class DeepIC(_DeepICBase):
         }
 
 
-class Deepic2(_DeepICBase):
-    def __init__(
-        self,
-        hidden_dim: int = 128,
-        n_heads: int = 8,
-        ff_dim: int = 256,
-        dropout: float = 0.0,
-    ):
-        super().__init__(hidden_dim=hidden_dim, n_heads=n_heads, ff_dim=ff_dim, dropout=dropout)
-        self.scoring_head = ScoringHead(hidden_dim)
-
-    def decode_ranking(
-        self,
-        H_surr: torch.Tensor,
-        H_true: torch.Tensor,
-        progress: torch.Tensor,
-        target_ranking: torch.Tensor | None = None,
-        decode_type: str = "greedy",
-        max_decode_steps: int | None = None,
-    ) -> dict[str, torch.Tensor]:
-        logits = self.scoring_head(H_surr)
-        if decode_type == "sample":
-            u = torch.rand_like(logits).clamp_(1e-12, 1.0 - 1e-12)
-            gumbel = -torch.log(-torch.log(u))
-            ranking_scores = logits + gumbel
-        else:
-            ranking_scores = logits
-
-        ranking = torch.argsort(ranking_scores, dim=-1, descending=True)
-        if max_decode_steps is not None:
-            ranking = ranking[:, : min(int(max_decode_steps), ranking.size(1))]
-        return {
-            "logits": logits,
-            "ranking": ranking,
-            "H_surr": H_surr,
-            "H_true": H_true,
-        }
-
-
 class SimplifiedDeepIC(_DeepICBase):
     def __init__(
         self,
@@ -733,8 +694,166 @@ class SimplifiedDeepIC(_DeepICBase):
         dropout: float = 0.0,
     ):
         super().__init__(hidden_dim=hidden_dim, n_heads=n_heads, ff_dim=ff_dim, dropout=dropout)
-        self.W_decode = nn.Parameter(torch.empty(hidden_dim))
-        nn.init.normal_(self.W_decode, mean=0.0, std=hidden_dim ** -0.5)
+        self.actor_decoder = nn.Sequential(
+            nn.LayerNorm(hidden_dim + 1),
+            nn.Linear(hidden_dim + 1, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self.critic_head = nn.Sequential(
+            nn.LayerNorm(2 * hidden_dim + 1),
+            nn.Linear(2 * hidden_dim + 1, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    @staticmethod
+    def _ensure_embedding_batch(x: torch.Tensor) -> torch.Tensor:
+        return x.unsqueeze(0) if x.dim() == 2 else x
+
+    def _prepare_progress_for_candidates(
+        self,
+        H_surr: torch.Tensor,
+        progress: torch.Tensor,
+    ) -> torch.Tensor:
+        H_surr = self._ensure_embedding_batch(H_surr)
+        progress_prepared = self._prepare_progress(
+            progress=progress,
+            device=H_surr.device,
+            dtype=H_surr.dtype,
+            batch_size=H_surr.size(0),
+        )
+        # (B, 1) -> (B, N, 1) so each candidate sees the same budget feature.
+        return progress_prepared.unsqueeze(1).expand(-1, H_surr.size(1), -1)
+
+    def _actor_logits(
+        self,
+        H_surr: torch.Tensor,
+        progress: torch.Tensor,
+    ) -> torch.Tensor:
+        H_surr = self._ensure_embedding_batch(H_surr)
+        progress_feature = self._prepare_progress_for_candidates(H_surr, progress)
+        # Concatenate candidate embedding and normalized budget progress: (B, N, h + 1).
+        actor_input = torch.cat([H_surr, progress_feature], dim=-1)
+        return self.actor_decoder(actor_input).squeeze(-1)
+
+    def get_value(
+        self,
+        H_surr: torch.Tensor,
+        H_true: torch.Tensor,
+        progress: torch.Tensor,
+    ) -> torch.Tensor:
+        H_surr = self._ensure_embedding_batch(H_surr)
+        H_true = self._ensure_embedding_batch(H_true)
+        progress_prepared = self._prepare_progress(
+            progress=progress,
+            device=H_surr.device,
+            dtype=H_surr.dtype,
+            batch_size=H_surr.size(0),
+        )
+        surr_pool = H_surr.mean(dim=1)
+        true_pool = H_true.mean(dim=1)
+        critic_input = torch.cat([surr_pool, true_pool, progress_prepared], dim=-1)
+        return self.critic_head(critic_input).squeeze(-1)
+
+    def _sample_actions_without_replacement(
+        self,
+        logits: torch.Tensor,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, n_sur = logits.shape
+        selected_mask = torch.zeros(bsz, n_sur, dtype=torch.bool, device=logits.device)
+        actions = []
+        logprob = torch.zeros(bsz, dtype=logits.dtype, device=logits.device)
+        entropy = torch.zeros_like(logprob)
+        decode_steps = min(int(k), n_sur)
+
+        for _ in range(decode_steps):
+            masked_logits = logits.masked_fill(selected_mask, -1e9)
+            dist = torch.distributions.Categorical(logits=masked_logits)
+            chosen_idx = dist.sample()
+            actions.append(chosen_idx.unsqueeze(1))
+            logprob = logprob + dist.log_prob(chosen_idx)
+            entropy = entropy + dist.entropy()
+            selected_mask = selected_mask.scatter(1, chosen_idx.unsqueeze(1), True)
+
+        return torch.cat(actions, dim=1), logprob, entropy
+
+    def act(
+        self,
+        H_surr: torch.Tensor,
+        H_true: torch.Tensor,
+        progress: torch.Tensor,
+        k: int = 1,
+        decode_type: str = "sample",
+    ) -> dict[str, torch.Tensor]:
+        H_surr = self._ensure_embedding_batch(H_surr)
+        H_true = self._ensure_embedding_batch(H_true)
+        logits = self._actor_logits(H_surr, progress)
+        value = self.get_value(H_surr, H_true, progress)
+        decode_steps = min(int(k), logits.size(1))
+
+        if decode_type == "greedy":
+            actions = torch.topk(logits, k=decode_steps, dim=-1).indices
+            eval_out = self.evaluate_actions(H_surr, H_true, progress, actions)
+            logprob = eval_out["logprob"]
+            entropy = eval_out["entropy"]
+        elif decode_type == "sample":
+            actions, logprob, entropy = self._sample_actions_without_replacement(logits, decode_steps)
+        else:
+            raise ValueError(f"Unsupported decode_type: {decode_type}")
+
+        return {
+            "actions": actions,
+            "logprob": logprob,
+            "entropy": entropy,
+            "value": value,
+            "logits": logits,
+        }
+
+    def evaluate_actions(
+        self,
+        H_surr: torch.Tensor,
+        H_true: torch.Tensor,
+        progress: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        H_surr = self._ensure_embedding_batch(H_surr)
+        H_true = self._ensure_embedding_batch(H_true)
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+
+        logits = self._actor_logits(H_surr, progress)
+        value = self.get_value(H_surr, H_true, progress)
+
+        bsz, n_sur = logits.shape
+        decode_steps = min(actions.size(1), n_sur)
+        selected_mask = torch.zeros(bsz, n_sur, dtype=torch.bool, device=logits.device)
+        logprob = torch.zeros(bsz, dtype=logits.dtype, device=logits.device)
+        entropy = torch.zeros_like(logprob)
+
+        for step in range(decode_steps):
+            masked_logits = logits.masked_fill(selected_mask, -1e9)
+            dist = torch.distributions.Categorical(logits=masked_logits)
+            chosen_idx = actions[:, step]
+            logprob = logprob + dist.log_prob(chosen_idx)
+            entropy = entropy + dist.entropy()
+            selected_mask = selected_mask.scatter(1, chosen_idx.unsqueeze(1), True)
+
+        return {
+            "logprob": logprob,
+            "entropy": entropy,
+            "value": value,
+            "logits": logits,
+        }
 
     def decode_ranking(
         self,
@@ -745,23 +864,15 @@ class SimplifiedDeepIC(_DeepICBase):
         decode_type: str = "greedy",
         max_decode_steps: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        logits = torch.einsum("bnh,h->bn", H_surr, self.W_decode)
+        H_surr = self._ensure_embedding_batch(H_surr)
+        H_true = self._ensure_embedding_batch(H_true)
+        logits = self._actor_logits(H_surr, progress)
 
         if target_ranking is not None:
             ranking = target_ranking
         elif decode_type == "sample":
-            bsz, n_sur = logits.shape
-            ranking_steps = []
-            selected_mask = torch.zeros(bsz, n_sur, dtype=torch.bool, device=logits.device)
-            decode_steps = n_sur if max_decode_steps is None else min(int(max_decode_steps), n_sur)
-
-            for _ in range(decode_steps):
-                masked_logits = logits.masked_fill(selected_mask, -1e9)
-                chosen_idx = torch.distributions.Categorical(logits=masked_logits).sample()
-                ranking_steps.append(chosen_idx.unsqueeze(1))
-                selected_mask = selected_mask.scatter(1, chosen_idx.unsqueeze(1), True)
-
-            ranking = torch.cat(ranking_steps, dim=1)
+            decode_steps = logits.size(1) if max_decode_steps is None else min(int(max_decode_steps), logits.size(1))
+            ranking, _, _ = self._sample_actions_without_replacement(logits, decode_steps)
         else:
             ranking = torch.argsort(logits, dim=-1, descending=True)
             if max_decode_steps is not None:
@@ -776,6 +887,46 @@ class SimplifiedDeepIC(_DeepICBase):
             "H_surr": H_surr,
             "H_true": H_true,
         }
+
+
+def ppo_loss(
+    agent: SimplifiedDeepIC,
+    batch: dict[str, torch.Tensor],
+    clip_eps: float = 0.2,
+    value_coef: float = 0.5,
+    entropy_coef: float = 0.01,
+) -> dict[str, torch.Tensor]:
+    eval_out = agent.evaluate_actions(
+        H_surr=batch["H_surr"],
+        H_true=batch["H_true"],
+        progress=batch["progress"],
+        actions=batch["actions"],
+    )
+
+    new_logprob = eval_out["logprob"]
+    entropy = eval_out["entropy"]
+    value = eval_out["value"]
+    old_logprob = batch["old_logprob"]
+    advantages = batch["advantages"]
+    returns = batch["returns"]
+
+    ratio = torch.exp(new_logprob - old_logprob)
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+    surrogate_1 = ratio * advantages
+    surrogate_2 = clipped_ratio * advantages
+    actor_loss = -torch.mean(torch.minimum(surrogate_1, surrogate_2))
+    critic_loss = F.mse_loss(value, returns)
+    entropy_loss = -torch.mean(entropy)
+    total_loss = actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss
+    approx_kl = torch.mean(old_logprob - new_logprob)
+
+    return {
+        "total_loss": total_loss,
+        "actor_loss": actor_loss,
+        "critic_loss": critic_loss,
+        "entropy_loss": entropy_loss,
+        "approx_kl": approx_kl,
+    }
 
 
 class HV_DeepIC(DeepIC):
@@ -818,6 +969,8 @@ class HV_DeepIC(DeepIC):
 
         prev_hv = cls.hypervolume(previous_archive, ref_point)
         next_hv = cls.hypervolume(combined_archive, ref_point)
+        if next_hv <= prev_hv:
+            return -1.0
         return float((next_hv - prev_hv) / (prev_hv + float(epsilon)))
 
     def pareto_improvement_reward(

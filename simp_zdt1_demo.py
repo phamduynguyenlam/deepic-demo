@@ -48,6 +48,7 @@ def _configure_simplified_deepic() -> None:
 def main():
     _configure_simplified_deepic()
     args = multisource.parse_args(TARGET_PROBLEM)
+    args.train_algo = "ppo"
     if args.dim != 30:
         print(f"Warning: expected 30D evaluation for {TARGET_PROBLEM}, but received dim={args.dim}.")
 
@@ -58,7 +59,7 @@ def main():
         )
 
     if args.train_only:
-        multisource.train_deepic_multisource(args, TARGET_PROBLEM, self_train_only=True)
+        multisource.train_deepic_multisource_ppo(args, TARGET_PROBLEM, self_train_only=True)
     else:
         base_demo.run_comparison(args, TARGET_PROBLEM, self_train_only=True)
 
