@@ -269,7 +269,7 @@ def _compute_reward(
     next_hv = float(demo.hypervolume_2d(demo.DeepICClass.pareto_front(combined_front), ref_point))
     if next_hv <= prev_hv:
         return 0.0
-    return float((next_hv - prev_hv) / (prev_hv + float(hv_epsilon)))
+    return float(50.0 * (next_hv - prev_hv) / (prev_hv + float(hv_epsilon)))
 
 
 def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
