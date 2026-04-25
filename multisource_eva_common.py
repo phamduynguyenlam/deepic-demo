@@ -163,6 +163,10 @@ def _reward_log_path(problem_name: str, self_train_only: bool = False) -> Path:
     return REWARD_LOG_DIR / f"{_problem_slug(problem_name)}_{_script_variant(self_train_only)}_train_rewards.json"
 
 
+def _surrogate_model_name(args) -> str:
+    return getattr(args, "surrogate_model", getattr(args, "uncertainty_model", "gp"))
+
+
 def build_args_namespace(parsed) -> SimpleNamespace:
     return SimpleNamespace(
         dim=parsed.dim,
@@ -181,6 +185,7 @@ def build_args_namespace(parsed) -> SimpleNamespace:
         deepic_adapt_steps=parsed.deepic_adapt_steps,
         surrogate_nsga_steps=parsed.surrogate_nsga_steps,
         discount=parsed.discount,
+        surrogate_model=_surrogate_model_name(parsed),
         seed=parsed.seed,
         device=parsed.device,
     )
@@ -214,6 +219,9 @@ def _compute_reward(
     previous_front: np.ndarray,
     selected_objectives: np.ndarray,
     reward_scheme: int = 1,
+    problem_name: str | None = None,
+    dim: int | None = None,
+    hv_epsilon: float = 1e-8,
 ) -> float:
     if int(reward_scheme) == 1:
         return float(
@@ -223,30 +231,45 @@ def _compute_reward(
             )
         )
 
-    if int(reward_scheme) != 2:
+    if int(reward_scheme) == 2:
+        previous_front = demo.DeepICClass.pareto_front(np.asarray(previous_front, dtype=np.float32))
+        selected_objectives = np.asarray(selected_objectives, dtype=np.float32)
+
+        improved = False
+        for candidate in selected_objectives:
+            if not any(demo.DeepICClass._dominates(prev, candidate) for prev in previous_front):
+                improved = True
+                break
+
+        if not improved:
+            return 0.0
+
+        reward = 0.0
+        origin = np.zeros(previous_front.shape[1], dtype=np.float32)
+        for candidate in selected_objectives:
+            distances = np.abs(previous_front - candidate).sum(axis=1)
+            nearest_idx = int(np.argmin(distances))
+            d_i = float(distances[nearest_idx])
+            d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
+            reward += d_i / max(d_ref_i, 1e-12)
+        return float(reward)
+
+    if int(reward_scheme) != 3:
         raise ValueError(f"Unsupported reward_scheme: {reward_scheme}")
 
-    previous_front = demo.DeepICClass.pareto_front(np.asarray(previous_front, dtype=np.float32))
+    if problem_name is None or dim is None:
+        raise ValueError("reward_scheme=3 requires problem_name and dim for HV reference point.")
+
+    previous_front = np.asarray(previous_front, dtype=np.float32)
     selected_objectives = np.asarray(selected_objectives, dtype=np.float32)
+    combined_front = np.vstack([previous_front, selected_objectives])
+    ref_point = np.asarray(nsga_eic._reference_point(problem_name, int(dim)), dtype=np.float32)
 
-    improved = False
-    for candidate in selected_objectives:
-        if not any(demo.DeepICClass._dominates(prev, candidate) for prev in previous_front):
-            improved = True
-            break
-
-    if not improved:
+    prev_hv = float(demo.hypervolume_2d(demo.DeepICClass.pareto_front(previous_front), ref_point))
+    next_hv = float(demo.hypervolume_2d(demo.DeepICClass.pareto_front(combined_front), ref_point))
+    if next_hv <= prev_hv:
         return 0.0
-
-    reward = 0.0
-    origin = np.zeros(previous_front.shape[1], dtype=np.float32)
-    for candidate in selected_objectives:
-        distances = np.abs(previous_front - candidate).sum(axis=1)
-        nearest_idx = int(np.argmin(distances))
-        d_i = float(distances[nearest_idx])
-        d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
-        reward += d_i / max(d_ref_i, 1e-12)
-    return float(reward)
+    return float((next_hv - prev_hv) / (prev_hv + float(hv_epsilon)))
 
 
 def load_or_prepare_kan_surrogate(problem_name: str, dim: int, args) -> dict:
@@ -619,7 +642,8 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
     print(
         f"Training config | deepic_lr={args.deepic_lr:.1e} | "
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
-        f"reward_scheme={getattr(args, 'reward_scheme', 1)}"
+        f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
+        f"surrogate_model={_surrogate_model_name(args)}"
     )
     pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
@@ -663,6 +687,14 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                     seed=args.seed + epoch * 10000 + _stable_seed(0, problem_name, dim),
                 )
                 archive_y = problem.evaluate(archive_x)
+                uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+                gp_surrogates = None
+                if _surrogate_model_name(args) == "gp":
+                    gp_surrogates = demo.fit_gp_surrogates(
+                        archive_x=uncertainty_x,
+                        archive_y=uncertainty_y,
+                        seed=args.seed + epoch * 10000 + _stable_seed(31, problem_name, dim),
+                    )
                 true_evals = args.archive_size
                 remaining_budget = args.max_fe - true_evals
                 steps_to_run = remaining_budget // args.k_eval
@@ -682,13 +714,17 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                         predict_fn=demo.predict_with_kan,
                         generate_fn=demo.generate_offspring,
                     )
-                    archive_pred = demo.predict_with_kan(surrogates, archive_x_t, args.device).astype(np.float32)
-                    offspring_sigma = demo.estimate_uncertainty(
-                        archive_x=archive_x_t,
-                        archive_y=archive_y_t,
-                        archive_pred=archive_pred,
-                        offspring_x=offspring_x,
-                    ).astype(np.float32)
+                    if gp_surrogates is not None:
+                        _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
+                        offspring_sigma = offspring_sigma.astype(np.float32)
+                    else:
+                        archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
+                        offspring_sigma = demo.estimate_uncertainty(
+                            archive_x=uncertainty_x,
+                            archive_y=uncertainty_y,
+                            archive_pred=archive_pred,
+                            offspring_x=offspring_x,
+                        ).astype(np.float32)
 
                     progress = float(true_evals / args.max_fe)
                     ranking = demo.infer_deepic_ranking(
@@ -713,6 +749,8 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                         previous_front=archive_y_t,
                         selected_objectives=selected_y,
                         reward_scheme=int(getattr(args, "reward_scheme", 1)),
+                        problem_name=problem_name,
+                        dim=dim,
                     )
                     reward_value = float(reward)
                     epoch_rewards.append(reward_value)
@@ -745,6 +783,12 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                     archive_x, archive_y = demo.update_archive(
                         archive_x=archive_x_t,
                         archive_y=archive_y_t,
+                        new_x=selected_x,
+                        new_y=selected_y,
+                    )
+                    uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                        uncertainty_x=uncertainty_x,
+                        uncertainty_y=uncertainty_y,
                         new_x=selected_x,
                         new_y=selected_y,
                     )
@@ -801,6 +845,7 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
             "source_dims": SOURCE_DIMS,
             "training_label": _training_label(self_train_only),
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
+            "surrogate_model": _surrogate_model_name(args),
             "epoch_mean_rewards": epoch_mean_rewards,
             "records": reward_records,
         },
@@ -816,7 +861,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
         f"ppo_epochs={getattr(args, 'ppo_epochs', 4)} | "
         f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f} | "
-        f"reward_scheme={getattr(args, 'reward_scheme', 1)}"
+        f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
+        f"surrogate_model={_surrogate_model_name(args)}"
     )
     pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
@@ -872,6 +918,14 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                     seed=args.seed + epoch * 10000 + _stable_seed(0, problem_name, dim),
                 )
                 archive_y = problem.evaluate(archive_x)
+                uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+                gp_surrogates = None
+                if _surrogate_model_name(args) == "gp":
+                    gp_surrogates = demo.fit_gp_surrogates(
+                        archive_x=uncertainty_x,
+                        archive_y=uncertainty_y,
+                        seed=args.seed + epoch * 10000 + _stable_seed(17, problem_name, dim),
+                    )
                 true_evals = args.archive_size
                 remaining_budget = args.max_fe - true_evals
                 steps_to_run = remaining_budget // args.k_eval
@@ -891,13 +945,17 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                         predict_fn=demo.predict_with_kan,
                         generate_fn=demo.generate_offspring,
                     )
-                    archive_pred = demo.predict_with_kan(surrogates, archive_x_t, args.device).astype(np.float32)
-                    offspring_sigma = demo.estimate_uncertainty(
-                        archive_x=archive_x_t,
-                        archive_y=archive_y_t,
-                        archive_pred=archive_pred,
-                        offspring_x=offspring_x,
-                    ).astype(np.float32)
+                    if gp_surrogates is not None:
+                        _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
+                        offspring_sigma = offspring_sigma.astype(np.float32)
+                    else:
+                        archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
+                        offspring_sigma = demo.estimate_uncertainty(
+                            archive_x=uncertainty_x,
+                            archive_y=uncertainty_y,
+                            archive_pred=archive_pred,
+                            offspring_x=offspring_x,
+                        ).astype(np.float32)
 
                     progress = float(true_evals / args.max_fe)
                     with demo.torch.no_grad():
@@ -933,6 +991,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                             previous_front=archive_y_t,
                             selected_objectives=selected_y,
                             reward_scheme=int(getattr(args, "reward_scheme", 1)),
+                            problem_name=problem_name,
+                            dim=dim,
                         )
                     )
                     epoch_rewards.append(reward_value)
@@ -970,6 +1030,12 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                     archive_x, archive_y = demo.update_archive(
                         archive_x=archive_x_t,
                         archive_y=archive_y_t,
+                        new_x=selected_x,
+                        new_y=selected_y,
+                    )
+                    uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                        uncertainty_x=uncertainty_x,
+                        uncertainty_y=uncertainty_y,
                         new_x=selected_x,
                         new_y=selected_y,
                     )
@@ -1041,6 +1107,7 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
             "source_dims": SOURCE_DIMS,
             "training_label": _training_label(self_train_only),
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
+            "surrogate_model": _surrogate_model_name(args),
             "epoch_mean_rewards": epoch_mean_rewards,
             "epoch_mean_total_losses": epoch_mean_total_losses,
             "ppo_epochs": ppo_epochs,
@@ -1096,6 +1163,14 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         if archive_x.shape != (args.archive_size, args.dim):
             raise ValueError("initial_archive_x must have shape (archive_size, dim).")
     archive_y = problem.evaluate(archive_x)
+    uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+    gp_surrogates = None
+    if _surrogate_model_name(args) == "gp":
+        gp_surrogates = demo.fit_gp_surrogates(
+            archive_x=uncertainty_x,
+            archive_y=uncertainty_y,
+            seed=args.seed + _stable_seed(53, target_problem, args.dim),
+        )
     true_evals = args.archive_size
     steps_to_run = (args.max_fe - true_evals) // args.k_eval
     hv_history = []
@@ -1122,13 +1197,17 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             predict_fn=demo.predict_with_kan,
             generate_fn=demo.generate_offspring,
         )
-        archive_pred = demo.predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-        offspring_sigma = demo.estimate_uncertainty(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            archive_pred=archive_pred,
-            offspring_x=offspring_x,
-        ).astype(np.float32)
+        if gp_surrogates is not None:
+            _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
+            offspring_sigma = offspring_sigma.astype(np.float32)
+        else:
+            archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
+            offspring_sigma = demo.estimate_uncertainty(
+                archive_x=uncertainty_x,
+                archive_y=uncertainty_y,
+                archive_pred=archive_pred,
+                offspring_x=offspring_x,
+            ).astype(np.float32)
 
         progress = float(true_evals / args.max_fe)
         ranking = demo.infer_deepic_ranking(
@@ -1153,6 +1232,8 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
                 previous_front=archive_y,
                 selected_objectives=selected_y,
                 reward_scheme=int(getattr(args, "reward_scheme", 1)),
+                problem_name=target_problem,
+                dim=args.dim,
             )
         )
         reward_history.append(reward_value)
@@ -1160,6 +1241,12 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         archive_x, archive_y = demo.update_archive(
             archive_x=archive_x,
             archive_y=archive_y,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
             new_x=selected_x,
             new_y=selected_y,
         )
@@ -1291,7 +1378,7 @@ def parse_args(target_problem: str):
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
-    parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
+    parser.add_argument("--discount", type=float, default=1.0, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--train_algo", type=str, default="reinforce", choices=["reinforce", "ppo"])
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--ppo_minibatch_size", type=int, default=32)
@@ -1304,8 +1391,23 @@ def parse_args(target_problem: str):
         "--reward_scheme",
         type=int,
         default=1,
-        choices=[1, 2],
-        help="Reward scheme: 1=original reward, 2=improve=>sum(d_i/d_ref), no-improve=>0.",
+        choices=[1, 2, 3],
+        help="Reward scheme: 1=original reward, 2=improve=>sum(d_i/d_ref), no-improve=>0, 3=normalized HV improvement.",
+    )
+    parser.add_argument(
+        "--surrogate_model",
+        dest="surrogate_model",
+        type=str,
+        default="gp",
+        choices=["gp", "knn"],
+        help="Auxiliary surrogate model for DeepIC sigma input: gp=frozen Gaussian process trained on the initial archive, knn=local residual KNN on the uncertainty archive.",
+    )
+    parser.add_argument(
+        "--uncertainty_model",
+        dest="surrogate_model",
+        type=str,
+        choices=["gp", "knn"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")

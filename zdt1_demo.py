@@ -130,6 +130,14 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             raise ValueError("initial_archive_x must have shape (archive_size, dim).")
 
     archive_y = problem.evaluate(archive_x)
+    uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+    gp_surrogates = None
+    if demo.surrogate_model_name(args) == "gp":
+        gp_surrogates = demo.fit_gp_surrogates(
+            archive_x=uncertainty_x,
+            archive_y=uncertainty_y,
+            seed=args.seed + base._stable_seed(71, target_problem, args.dim),
+        )
     true_evals = args.archive_size
     steps_to_run = (args.max_fe - true_evals) // args.k_eval
     hv_history = []
@@ -171,13 +179,17 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         surrogate_archive_x = offspring_x.copy()
         surrogate_archive_y = offspring_pred.copy()
 
-        archive_pred = demo.predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-        offspring_sigma = demo.estimate_uncertainty(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            archive_pred=archive_pred,
-            offspring_x=offspring_x,
-        ).astype(np.float32)
+        if gp_surrogates is not None:
+            _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
+            offspring_sigma = offspring_sigma.astype(np.float32)
+        else:
+            archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
+            offspring_sigma = demo.estimate_uncertainty(
+                archive_x=uncertainty_x,
+                archive_y=uncertainty_y,
+                archive_pred=archive_pred,
+                offspring_x=offspring_x,
+            ).astype(np.float32)
 
         progress = float(true_evals / args.max_fe)
         ranking = demo.infer_deepic_ranking(
@@ -208,6 +220,12 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         archive_x, archive_y = demo.update_archive(
             archive_x=archive_x,
             archive_y=archive_y,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
             new_x=selected_x,
             new_y=selected_y,
         )

@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from pymoo.indicators.hv import HV
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 import multisource_eva_common as multisource
 from problem.kan import KAN
@@ -135,6 +137,34 @@ def fit_kan_surrogates(
     return models
 
 
+def fit_gp_surrogates(
+    archive_x: np.ndarray,
+    archive_y: np.ndarray,
+    seed: int,
+) -> list[GaussianProcessRegressor]:
+    archive_x = np.asarray(archive_x, dtype=np.float32)
+    archive_y = np.asarray(archive_y, dtype=np.float32)
+    models: list[GaussianProcessRegressor] = []
+
+    for obj_id in range(archive_y.shape[1]):
+        kernel = (
+            ConstantKernel(constant_value=1.0, constant_value_bounds="fixed")
+            * RBF(length_scale=0.5, length_scale_bounds="fixed")
+            + WhiteKernel(noise_level=1e-5, noise_level_bounds="fixed")
+        )
+        model = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=1e-6,
+            normalize_y=True,
+            optimizer=None,
+            random_state=seed + obj_id,
+        )
+        model.fit(archive_x, archive_y[:, obj_id])
+        models.append(model)
+
+    return models
+
+
 def predict_with_kan(models: Sequence[Any], x: np.ndarray, device: str) -> np.ndarray:
     x_tensor = torch.tensor(x, dtype=torch.float32, device=device)
     preds = []
@@ -143,6 +173,65 @@ def predict_with_kan(models: Sequence[Any], x: np.ndarray, device: str) -> np.nd
             pred = model(x_tensor).detach().cpu().numpy().reshape(-1)
         preds.append(pred)
     return np.stack(preds, axis=1)
+
+
+def predict_with_gp(models: Sequence[GaussianProcessRegressor], x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x_arr = np.asarray(x, dtype=np.float32)
+    mean_preds: list[np.ndarray] = []
+    std_preds: list[np.ndarray] = []
+
+    for model in models:
+        mean, std = model.predict(x_arr, return_std=True)
+        mean_preds.append(np.asarray(mean, dtype=np.float32).reshape(-1))
+        std_preds.append(np.asarray(std, dtype=np.float32).reshape(-1))
+
+    mean_array = np.stack(mean_preds, axis=1).astype(np.float32)
+    std_array = np.stack(std_preds, axis=1).astype(np.float32)
+    return mean_array, std_array + 1e-6
+
+
+def surrogate_model_name(args) -> str:
+    return getattr(args, "surrogate_model", getattr(args, "uncertainty_model", "gp"))
+
+
+def build_uncertainty_models(
+    archive_x: np.ndarray,
+    archive_y: np.ndarray,
+    seed: int,
+    surrogate_model: str = "gp",
+) -> list[GaussianProcessRegressor] | None:
+    if surrogate_model == "gp":
+        return fit_gp_surrogates(archive_x=archive_x, archive_y=archive_y, seed=seed)
+    if surrogate_model == "knn":
+        return None
+    raise ValueError(f"Unsupported surrogate_model: {surrogate_model}")
+
+
+def predict_offspring_sigma(
+    kan_surrogates: Sequence[Any],
+    offspring_x: np.ndarray,
+    uncertainty_x: np.ndarray,
+    uncertainty_y: np.ndarray,
+    device: str,
+    surrogate_model: str = "gp",
+    gp_surrogates: Sequence[GaussianProcessRegressor] | None = None,
+) -> np.ndarray:
+    if surrogate_model == "gp":
+        if gp_surrogates is None:
+            raise ValueError("GP uncertainty requested but gp_surrogates is None.")
+        _, offspring_sigma = predict_with_gp(gp_surrogates, offspring_x)
+        return offspring_sigma.astype(np.float32)
+
+    if surrogate_model != "knn":
+        raise ValueError(f"Unsupported surrogate_model: {surrogate_model}")
+
+    archive_pred = predict_with_kan(kan_surrogates, uncertainty_x, device).astype(np.float32)
+    return estimate_uncertainty(
+        archive_x=uncertainty_x,
+        archive_y=uncertainty_y,
+        archive_pred=archive_pred,
+        offspring_x=offspring_x,
+    ).astype(np.float32)
 
 
 def estimate_uncertainty(
@@ -158,6 +247,51 @@ def estimate_uncertainty(
     nn_idx = np.argsort(dist, axis=1)[:, :n_neighbors]
     local_residual = residual[nn_idx]
     return local_residual.mean(axis=1) + 1e-6
+
+
+def init_uncertainty_archive(
+    archive_x: np.ndarray,
+    archive_y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    return (
+        np.asarray(archive_x, dtype=np.float32).copy(),
+        np.asarray(archive_y, dtype=np.float32).copy(),
+    )
+
+
+def update_uncertainty_archive(
+    uncertainty_x: np.ndarray,
+    uncertainty_y: np.ndarray,
+    new_x: np.ndarray,
+    new_y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    uncertainty_x = np.asarray(uncertainty_x, dtype=np.float32)
+    uncertainty_y = np.asarray(uncertainty_y, dtype=np.float32)
+    new_x = np.asarray(new_x, dtype=np.float32)
+    new_y = np.asarray(new_y, dtype=np.float32)
+
+    if new_x.size == 0 or new_y.size == 0:
+        return uncertainty_x, uncertainty_y
+
+    if uncertainty_x.size == 0:
+        merged_x = new_x
+        merged_y = new_y
+    else:
+        merged_x = np.vstack([uncertainty_x, new_x])
+        merged_y = np.vstack([uncertainty_y, new_y])
+
+    unique_indices = []
+    for i in range(merged_x.shape[0]):
+        is_duplicate = False
+        for j in unique_indices:
+            if np.allclose(merged_x[i], merged_x[j]) and np.allclose(merged_y[i], merged_y[j]):
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            unique_indices.append(i)
+
+    unique_indices = np.asarray(unique_indices, dtype=np.int64)
+    return merged_x[unique_indices], merged_y[unique_indices]
 
 
 def generate_offspring(
@@ -688,6 +822,13 @@ def infer_zdt7(args, deepic=None):
         seed=args.seed,
     )
     archive_y = problem.evaluate(archive_x)
+    uncertainty_x, uncertainty_y = init_uncertainty_archive(archive_x, archive_y)
+    gp_surrogates = build_uncertainty_models(
+        archive_x=uncertainty_x,
+        archive_y=uncertainty_y,
+        seed=args.seed + 31,
+        surrogate_model=surrogate_model_name(args),
+    )
     
     # Set FIXED reference point for ZDT7 (from literature)
     # ZDT7: f1 ∈ [0,1], f2 depends on dimension and problem structure
@@ -715,13 +856,15 @@ def infer_zdt7(args, deepic=None):
             sigma=args.mutation_sigma,
         )
         offspring_pred = predict_with_kan(surrogates, offspring_x, args.device).astype(np.float32)
-        archive_pred = predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-        offspring_sigma = estimate_uncertainty(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            archive_pred=archive_pred,
+        offspring_sigma = predict_offspring_sigma(
+            kan_surrogates=surrogates,
             offspring_x=offspring_x,
-        ).astype(np.float32)
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
+            device=args.device,
+            surrogate_model=surrogate_model_name(args),
+            gp_surrogates=gp_surrogates,
+        )
 
         progress = float(true_evals / max_fe)
         ranking = infer_deepic_ranking(
@@ -745,6 +888,12 @@ def infer_zdt7(args, deepic=None):
         archive_x, archive_y = update_archive(
             archive_x=archive_x,
             archive_y=archive_y,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        uncertainty_x, uncertainty_y = update_uncertainty_archive(
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
             new_x=selected_x,
             new_y=selected_y,
         )
@@ -833,6 +982,13 @@ def run_infer_zdt1(args, deepic=None, plot: bool = True, initial_archive_x: np.n
         if archive_x.shape != (80, args.dim):
             raise ValueError("initial_archive_x must have shape (80, dim).")
     archive_y = problem.evaluate(archive_x)
+    uncertainty_x, uncertainty_y = init_uncertainty_archive(archive_x, archive_y)
+    gp_surrogates = build_uncertainty_models(
+        archive_x=uncertainty_x,
+        archive_y=uncertainty_y,
+        seed=args.seed + 37,
+        surrogate_model=surrogate_model_name(args),
+    )
     
     ref_point = REFERENCE_POINTS["ZDT1"][:2].astype(np.float32)
     
@@ -866,13 +1022,15 @@ def run_infer_zdt1(args, deepic=None, plot: bool = True, initial_archive_x: np.n
             sigma=args.mutation_sigma,
         )
         offspring_pred = predict_with_kan(surrogates, offspring_x, args.device).astype(np.float32)
-        archive_pred = predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-        offspring_sigma = estimate_uncertainty(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            archive_pred=archive_pred,
+        offspring_sigma = predict_offspring_sigma(
+            kan_surrogates=surrogates,
             offspring_x=offspring_x,
-        ).astype(np.float32)
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
+            device=args.device,
+            surrogate_model=surrogate_model_name(args),
+            gp_surrogates=gp_surrogates,
+        )
 
         progress = float(true_evals / max_fe)
         ranking = infer_deepic_ranking(
@@ -896,6 +1054,12 @@ def run_infer_zdt1(args, deepic=None, plot: bool = True, initial_archive_x: np.n
         archive_x, archive_y = update_archive(
             archive_x=archive_x,
             archive_y=archive_y,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        uncertainty_x, uncertainty_y = update_uncertainty_archive(
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
             new_x=selected_x,
             new_y=selected_y,
         )
@@ -1034,6 +1198,13 @@ def train_deepic_zdt(args):
             problem = ZDTProblem(name=p_name, dim=args.dim)
             archive_x = np.random.uniform(problem.lower, problem.upper, size=(80, args.dim)).astype(np.float32)
             archive_y = problem.evaluate(archive_x)
+            uncertainty_x, uncertainty_y = init_uncertainty_archive(archive_x, archive_y)
+            gp_surrogates = build_uncertainty_models(
+                archive_x=uncertainty_x,
+                archive_y=uncertainty_y,
+                seed=args.seed + epoch * 1000 + sum(ord(ch) for ch in p_name),
+                surrogate_model=surrogate_model_name(args),
+            )
             true_evals = 80
             max_fe = 160
             remaining_budget = 80
@@ -1051,13 +1222,15 @@ def train_deepic_zdt(args):
                     sigma=args.mutation_sigma,
                 )
                 offspring_pred = predict_with_kan(surrogates, offspring_x, args.device).astype(np.float32)
-                archive_pred = predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-                offspring_sigma = estimate_uncertainty(
-                    archive_x=archive_x,
-                    archive_y=archive_y,
-                    archive_pred=archive_pred,
+                offspring_sigma = predict_offspring_sigma(
+                    kan_surrogates=surrogates,
                     offspring_x=offspring_x,
-                ).astype(np.float32)
+                    uncertainty_x=uncertainty_x,
+                    uncertainty_y=uncertainty_y,
+                    device=args.device,
+                    surrogate_model=surrogate_model_name(args),
+                    gp_surrogates=gp_surrogates,
+                )
 
                 progress = float(true_evals / max_fe)
                 ranking = infer_deepic_ranking(
@@ -1082,6 +1255,12 @@ def train_deepic_zdt(args):
                 archive_x, archive_y = update_archive(
                     archive_x=archive_x,
                     archive_y=archive_y,
+                    new_x=selected_x,
+                    new_y=selected_y,
+                )
+                uncertainty_x, uncertainty_y = update_uncertainty_archive(
+                    uncertainty_x=uncertainty_x,
+                    uncertainty_y=uncertainty_y,
                     new_x=selected_x,
                     new_y=selected_y,
                 )
@@ -1169,6 +1348,13 @@ def train_deepic_zdt1(args):
         problem = ZDTProblem(name='ZDT1', dim=args.dim)
         archive_x = np.random.uniform(problem.lower, problem.upper, size=(80, args.dim)).astype(np.float32)
         archive_y = problem.evaluate(archive_x)
+        uncertainty_x, uncertainty_y = init_uncertainty_archive(archive_x, archive_y)
+        gp_surrogates = build_uncertainty_models(
+            archive_x=uncertainty_x,
+            archive_y=uncertainty_y,
+            seed=args.seed + epoch * 1000 + 101,
+            surrogate_model=surrogate_model_name(args),
+        )
         true_evals = 80
         max_fe = 160
         remaining_budget = 80
@@ -1183,13 +1369,15 @@ def train_deepic_zdt1(args):
                 sigma=args.mutation_sigma,
             )
             offspring_pred = predict_with_kan(surrogates, offspring_x, args.device).astype(np.float32)
-            archive_pred = predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-            offspring_sigma = estimate_uncertainty(
-                archive_x=archive_x,
-                archive_y=archive_y,
-                archive_pred=archive_pred,
+            offspring_sigma = predict_offspring_sigma(
+                kan_surrogates=surrogates,
                 offspring_x=offspring_x,
-            ).astype(np.float32)
+                uncertainty_x=uncertainty_x,
+                uncertainty_y=uncertainty_y,
+                device=args.device,
+                surrogate_model=surrogate_model_name(args),
+                gp_surrogates=gp_surrogates,
+            )
 
             progress = float(true_evals / max_fe)
             ranking = infer_deepic_ranking(
@@ -1214,6 +1402,12 @@ def train_deepic_zdt1(args):
             archive_x, archive_y = update_archive(
                 archive_x=archive_x,
                 archive_y=archive_y,
+                new_x=selected_x,
+                new_y=selected_y,
+            )
+            uncertainty_x, uncertainty_y = update_uncertainty_archive(
+                uncertainty_x=uncertainty_x,
+                uncertainty_y=uncertainty_y,
                 new_x=selected_x,
                 new_y=selected_y,
             )
@@ -1306,6 +1500,21 @@ def parse_args():
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--max_fe", type=int, default=160)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
+    parser.add_argument(
+        "--surrogate_model",
+        dest="surrogate_model",
+        type=str,
+        default="gp",
+        choices=["gp", "knn"],
+        help="Auxiliary surrogate model for DeepIC sigma input: gp=frozen Gaussian process on the initial archive, knn=local residual KNN on the uncertainty archive.",
+    )
+    parser.add_argument(
+        "--uncertainty_model",
+        dest="surrogate_model",
+        type=str,
+        choices=["gp", "knn"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--use_saea", action='store_true', help="Use SAEA + DeepIC training loop")
@@ -1325,6 +1534,13 @@ def main():
     problem = ToyMultiObjectiveProblem(dim=args.dim, n_obj=args.n_obj, lower=0.0, upper=1.0)
     archive_x = np.random.uniform(problem.lower, problem.upper, size=(args.archive_size, args.dim)).astype(np.float32)
     archive_y = problem.evaluate(archive_x).astype(np.float32)
+    uncertainty_x, uncertainty_y = init_uncertainty_archive(archive_x, archive_y)
+    gp_surrogates = build_uncertainty_models(
+        archive_x=uncertainty_x,
+        archive_y=uncertainty_y,
+        seed=args.seed + 19,
+        surrogate_model=surrogate_model_name(args),
+    )
     true_evals_consumed = archive_x.shape[0]
     max_fe = args.max_fe if args.max_fe is not None else args.archive_size + args.iterations * args.k_eval
 
@@ -1399,13 +1615,15 @@ def main():
             sigma=args.mutation_sigma,
         )
         offspring_pred = predict_with_kan(surrogates, offspring_x, args.device).astype(np.float32)
-        archive_pred = predict_with_kan(surrogates, archive_x, args.device).astype(np.float32)
-        offspring_sigma = estimate_uncertainty(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            archive_pred=archive_pred,
+        offspring_sigma = predict_offspring_sigma(
+            kan_surrogates=surrogates,
             offspring_x=offspring_x,
-        ).astype(np.float32)
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
+            device=args.device,
+            surrogate_model=surrogate_model_name(args),
+            gp_surrogates=gp_surrogates,
+        )
         progress_ratio = min(true_evals_consumed / max(max_fe, 1), 1.0)
 
         deepic_ranking = infer_deepic_ranking(
@@ -1430,6 +1648,12 @@ def main():
         archive_x, archive_y = update_archive(
             archive_x=archive_x,
             archive_y=archive_y,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        uncertainty_x, uncertainty_y = update_uncertainty_archive(
+            uncertainty_x=uncertainty_x,
+            uncertainty_y=uncertainty_y,
             new_x=selected_x,
             new_y=selected_y,
         )
