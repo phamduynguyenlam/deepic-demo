@@ -163,8 +163,45 @@ def _reward_log_path(problem_name: str, self_train_only: bool = False) -> Path:
     return REWARD_LOG_DIR / f"{_problem_slug(problem_name)}_{_script_variant(self_train_only)}_train_rewards.json"
 
 
+def _best_reward_model_path(problem_name: str, train_algo: str = "reinforce", self_train_only: bool = False) -> Path:
+    algo_suffix = "_ppo" if str(train_algo).lower() == "ppo" else ""
+    if self_train_only:
+        return Path(__file__).resolve().parent / f"deepic_{_problem_slug(problem_name)}_{_training_label(self_train_only)}{algo_suffix}_best_reward.pth"
+    return Path(__file__).resolve().parent / f"deepic_{_problem_slug(problem_name)}_source_mix{algo_suffix}_best_reward.pth"
+
+
 def _surrogate_model_name(args) -> str:
     return getattr(args, "surrogate_model", getattr(args, "uncertainty_model", "gp"))
+
+
+def _build_ppo_optimizer(model, actor_lr: float, critic_lr: float):
+    critic_head = getattr(model, "critic_head", None)
+    critic_params = []
+    critic_param_ids: set[int] = set()
+
+    if critic_head is not None:
+        for param in critic_head.parameters():
+            if not param.requires_grad:
+                continue
+            critic_params.append(param)
+            critic_param_ids.add(id(param))
+
+    actor_params = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and id(param) not in critic_param_ids
+    ]
+
+    param_groups = []
+    if actor_params:
+        param_groups.append({"params": actor_params, "lr": float(actor_lr)})
+    if critic_params:
+        param_groups.append({"params": critic_params, "lr": float(critic_lr)})
+
+    if not param_groups:
+        raise ValueError("No trainable parameters found when building PPO optimizer.")
+
+    return demo.torch.optim.Adam(param_groups)
 
 
 def build_args_namespace(parsed) -> SimpleNamespace:
@@ -496,6 +533,7 @@ def _update_deepic_from_episode_ppo(
     value_coef: float,
     entropy_coef: float,
     grad_clip: float | None,
+    target_kl: float | None,
 ) -> dict[str, float]:
     if not episode_trajectory:
         return {
@@ -585,6 +623,7 @@ def _update_deepic_from_episode_ppo(
             device=device,
         )
 
+        stop_group_updates = False
         for _ in range(max(int(ppo_epochs), 1)):
             perm = demo.torch.randperm(group_size, device=device)
             for start in range(0, group_size, max(int(minibatch_size), 1)):
@@ -630,6 +669,14 @@ def _update_deepic_from_episode_ppo(
                 stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
                 stats["updates"] += 1.0
 
+                if target_kl is not None and float(target_kl) > 0.0:
+                    approx_kl = float(loss_dict["approx_kl"].detach().cpu())
+                    if approx_kl > float(target_kl):
+                        stop_group_updates = True
+                        break
+            if stop_group_updates:
+                break
+
     if stats["updates"] > 0:
         for key in ["total_loss", "actor_loss", "critic_loss", "entropy_loss", "approx_kl"]:
             stats[key] /= stats["updates"]
@@ -650,6 +697,12 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
     epoch_mean_rewards: list[float] = []
     model_path = _final_model_path(target_problem, self_train_only=self_train_only)
     reward_log_path = _reward_log_path(target_problem, self_train_only=self_train_only)
+    best_reward_model_path = _best_reward_model_path(
+        target_problem,
+        train_algo=getattr(args, "train_algo", "reinforce"),
+        self_train_only=self_train_only,
+    )
+    best_epoch_mean_reward = float("-inf")
 
     deepic = demo.DeepICClass(
         hidden_dim=args.deepic_hidden,
@@ -822,6 +875,13 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
         epoch_mean_rewards.append(epoch_mean)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
+        if epoch_mean > best_epoch_mean_reward:
+            best_epoch_mean_reward = epoch_mean
+            demo.torch.save(deepic.state_dict(), best_reward_model_path)
+            print(
+                f"New best mean reward at epoch {epoch + 1}: {epoch_mean:.6f} | "
+                f"saved to {best_reward_model_path.name}"
+            )
         demo.torch.save(
             deepic.state_dict(),
             _epoch_checkpoint_path(target_problem, epoch + 1, self_train_only=self_train_only),
@@ -846,6 +906,8 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
             "training_label": _training_label(self_train_only),
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": _surrogate_model_name(args),
+            "best_reward_model_path": str(best_reward_model_path),
+            "best_epoch_mean_reward": best_epoch_mean_reward,
             "epoch_mean_rewards": epoch_mean_rewards,
             "records": reward_records,
         },
@@ -857,10 +919,14 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
 def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: bool = False):
     demo.set_seed(args.seed)
     print(
-        f"Training config (PPO) | deepic_lr={args.deepic_lr:.1e} | "
+        f"Training config (PPO) | "
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
         f"ppo_epochs={getattr(args, 'ppo_epochs', 4)} | "
         f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f} | "
+        f"actor_lr={getattr(args, 'ppo_actor_lr', 3e-4):.1e} | "
+        f"critic_lr={getattr(args, 'ppo_critic_lr', 5e-5):.1e} | "
+        f"vf_coef={getattr(args, 'ppo_value_coef', 0.1):.3f} | "
+        f"target_kl={getattr(args, 'ppo_target_kl', 0.02):.3f} | "
         f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
         f"surrogate_model={_surrogate_model_name(args)}"
     )
@@ -870,6 +936,12 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
     epoch_mean_total_losses: list[float] = []
     model_path = _final_model_path(target_problem, self_train_only=self_train_only)
     reward_log_path = _reward_log_path(target_problem, self_train_only=self_train_only)
+    best_reward_model_path = _best_reward_model_path(
+        target_problem,
+        train_algo="ppo",
+        self_train_only=self_train_only,
+    )
+    best_epoch_mean_reward = float("-inf")
 
     deepic = demo.DeepICClass(
         hidden_dim=args.deepic_hidden,
@@ -878,7 +950,13 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
     ).to(args.device)
     if not hasattr(deepic, "act") or not hasattr(deepic, "evaluate_actions"):
         raise TypeError("PPO training requires DeepICClass to implement act() and evaluate_actions().")
-    deepic_optimizer = demo.torch.optim.Adam(deepic.parameters(), lr=args.deepic_lr)
+    ppo_actor_lr = float(getattr(args, "ppo_actor_lr", 3e-4))
+    ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 5e-5))
+    deepic_optimizer = _build_ppo_optimizer(
+        deepic,
+        actor_lr=ppo_actor_lr,
+        critic_lr=ppo_critic_lr,
+    )
 
     if args.start_epoch > 0:
         checkpoint_path = _epoch_checkpoint_path(target_problem, args.start_epoch, self_train_only=self_train_only)
@@ -891,10 +969,11 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
     ppo_epochs = int(getattr(args, "ppo_epochs", 4))
     ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
     ppo_clip_eps = float(getattr(args, "ppo_clip_eps", 0.2))
-    ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.5))
+    ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.1))
     ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
     ppo_gae_lambda = float(getattr(args, "ppo_gae_lambda", 0.95))
     ppo_grad_clip = float(getattr(args, "ppo_grad_clip", 1.0))
+    ppo_target_kl = float(getattr(args, "ppo_target_kl", 0.02))
 
     for epoch in range(args.start_epoch, TRAIN_EPOCHS):
         print(f"Epoch {epoch + 1}/{TRAIN_EPOCHS}")
@@ -1069,6 +1148,7 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                     value_coef=ppo_value_coef,
                     entropy_coef=ppo_entropy_coef,
                     grad_clip=ppo_grad_clip,
+                    target_kl=ppo_target_kl,
                 )
                 epoch_total_losses.append(loss_stats["total_loss"])
                 print(
@@ -1084,6 +1164,13 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         epoch_mean_total_losses.append(epoch_mean_loss)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         print(f"Epoch {epoch + 1} mean PPO total loss: {epoch_mean_loss:.6f}")
+        if epoch_mean > best_epoch_mean_reward:
+            best_epoch_mean_reward = epoch_mean
+            demo.torch.save(deepic.state_dict(), best_reward_model_path)
+            print(
+                f"New best mean reward at epoch {epoch + 1}: {epoch_mean:.6f} | "
+                f"saved to {best_reward_model_path.name}"
+            )
         demo.torch.save(
             deepic.state_dict(),
             _epoch_checkpoint_path(target_problem, epoch + 1, self_train_only=self_train_only),
@@ -1108,15 +1195,20 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
             "training_label": _training_label(self_train_only),
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": _surrogate_model_name(args),
+            "best_reward_model_path": str(best_reward_model_path),
+            "best_epoch_mean_reward": best_epoch_mean_reward,
             "epoch_mean_rewards": epoch_mean_rewards,
             "epoch_mean_total_losses": epoch_mean_total_losses,
             "ppo_epochs": ppo_epochs,
+            "ppo_actor_lr": ppo_actor_lr,
+            "ppo_critic_lr": ppo_critic_lr,
             "ppo_minibatch_size": ppo_minibatch_size,
             "ppo_clip_eps": ppo_clip_eps,
             "ppo_value_coef": ppo_value_coef,
             "ppo_entropy_coef": ppo_entropy_coef,
             "ppo_gae_lambda": ppo_gae_lambda,
             "ppo_grad_clip": ppo_grad_clip,
+            "ppo_target_kl": ppo_target_kl,
             "records": reward_records,
         },
     )
@@ -1381,12 +1473,15 @@ def parse_args(target_problem: str):
     parser.add_argument("--discount", type=float, default=1.0, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--train_algo", type=str, default="reinforce", choices=["reinforce", "ppo"])
     parser.add_argument("--ppo_epochs", type=int, default=4)
+    parser.add_argument("--ppo_actor_lr", type=float, default=3e-4)
+    parser.add_argument("--ppo_critic_lr", type=float, default=5e-5)
     parser.add_argument("--ppo_minibatch_size", type=int, default=32)
     parser.add_argument("--ppo_clip_eps", type=float, default=0.2)
-    parser.add_argument("--ppo_value_coef", type=float, default=0.5)
+    parser.add_argument("--ppo_value_coef", type=float, default=0.1)
     parser.add_argument("--ppo_entropy_coef", type=float, default=0.01)
     parser.add_argument("--ppo_gae_lambda", type=float, default=0.95)
     parser.add_argument("--ppo_grad_clip", type=float, default=1.0)
+    parser.add_argument("--ppo_target_kl", type=float, default=0.02)
     parser.add_argument(
         "--reward_scheme",
         type=int,
