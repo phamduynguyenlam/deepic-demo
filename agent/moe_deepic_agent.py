@@ -72,8 +72,9 @@ class StateWiseMoEDecoder(nn.Module):
         )  # (B, h+1)
 
         gate_logits = self.gate(gate_input)  # (B, E)
+        temperature = max(float(self.temperature), 1e-6)
         gate_weights = torch.softmax(
-            gate_logits / self.temperature,
+            gate_logits / temperature,
             dim=-1,
         )  # (B, E)
 
@@ -103,11 +104,11 @@ class MoE_SimplifiedDeepIC(SimplifiedDeepIC):
     ):
         super().__init__(hidden_dim=hidden_dim, n_heads=n_heads, ff_dim=ff_dim, dropout=dropout)
         self.actor_decoder = StateWiseMoEDecoder(
-        hidden_dim=hidden_dim,
-        n_experts=n_experts,
-        dropout=dropout,
-        temperature=temperature,
-    )
+            hidden_dim=hidden_dim,
+            n_experts=n_experts,
+            dropout=dropout,
+            temperature=temperature,
+        )
 
     def _actor_logits_full(
         self,
@@ -201,8 +202,12 @@ class MoE_SimplifiedDeepIC(SimplifiedDeepIC):
 
 
 def moe_balance_loss(gate_weights: torch.Tensor) -> torch.Tensor:
-    # gate_weights: (B, E)
-    usage = gate_weights.mean(dim=0)
+    if gate_weights.dim() == 3:
+        usage = gate_weights.mean(dim=(0, 1))
+    elif gate_weights.dim() == 2:
+        usage = gate_weights.mean(dim=0)
+    else:
+        raise ValueError(f"Unexpected gate_weights shape: {tuple(gate_weights.shape)}")
     target = torch.full_like(usage, 1.0 / gate_weights.size(-1))
     return F.mse_loss(usage, target)
 
@@ -226,6 +231,9 @@ def moe_ppo_loss(
     
     eval_out = agent.evaluate_actions(batch["H_surr"], batch["H_true"], batch["progress"], batch["actions"])
     balance_loss = moe_balance_loss(eval_out["gate_weights"])
+    gate_weights = eval_out["gate_weights"]
+    gate_entropy = -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean()
     loss_dict["total_loss"] = loss_dict["total_loss"] + balance_coef * balance_loss
     loss_dict["balance_loss"] = balance_loss
+    loss_dict["gate_entropy"] = gate_entropy
     return loss_dict
