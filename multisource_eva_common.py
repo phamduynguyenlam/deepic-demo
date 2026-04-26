@@ -542,6 +542,10 @@ def _update_deepic_from_episode_ppo(
             "critic_loss": 0.0,
             "entropy_loss": 0.0,
             "approx_kl": 0.0,
+            "adv_mean": 0.0,
+            "adv_std": 0.0,
+            "adv_min": 0.0,
+            "adv_max": 0.0,
             "updates": 0.0,
         }
 
@@ -565,6 +569,10 @@ def _update_deepic_from_episode_ppo(
         "critic_loss": 0.0,
         "entropy_loss": 0.0,
         "approx_kl": 0.0,
+        "adv_mean": 0.0,
+        "adv_std": 0.0,
+        "adv_min": 0.0,
+        "adv_max": 0.0,
         "updates": 0.0,
     }
 
@@ -664,11 +672,16 @@ def _update_deepic_from_episode_ppo(
                     demo.torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
                 optimizer.step()
 
+                adv_slice = advantages[mb_idx]
                 stats["total_loss"] += float(loss_dict["total_loss"].detach().cpu())
                 stats["actor_loss"] += float(loss_dict["actor_loss"].detach().cpu())
                 stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
                 stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
                 stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
+                stats["adv_mean"] += float(adv_slice.mean().detach().cpu())
+                stats["adv_std"] += float(adv_slice.std(unbiased=False).detach().cpu()) if adv_slice.numel() > 1 else 0.0
+                stats["adv_min"] += float(adv_slice.min().detach().cpu())
+                stats["adv_max"] += float(adv_slice.max().detach().cpu())
                 stats["updates"] += 1.0
 
                 if target_kl is not None and float(target_kl) > 0.0:
@@ -680,7 +693,7 @@ def _update_deepic_from_episode_ppo(
                 break
 
     if stats["updates"] > 0:
-        for key in ["total_loss", "actor_loss", "critic_loss", "entropy_loss", "approx_kl"]:
+        for key in ["total_loss", "actor_loss", "critic_loss", "entropy_loss", "approx_kl", "adv_mean", "adv_std", "adv_min", "adv_max"]:
             stats[key] /= stats["updates"]
 
     return stats
@@ -1157,7 +1170,9 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                     f"Updated DeepIC PPO for {dim}D with {dim_problem_count} problems "
                     f"({len(dim_trajectories)} rollout steps), total_loss={loss_stats['total_loss']:.6f}, "
                     f"actor={loss_stats['actor_loss']:.6f}, critic={loss_stats['critic_loss']:.6f}, "
-                    f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}"
+                    f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}, "
+                    f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
+                    f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f}"
                 )
 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
