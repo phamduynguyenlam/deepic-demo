@@ -97,6 +97,7 @@ def _icw_ppo_loss(
     old_logprob = batch["old_logprob"]
     advantages = batch["advantages"]
     returns = batch["returns"]
+    logit_reg = eval_out.get("logit_reg", torch.zeros((), device=value.device))
 
     ratio = torch.exp(new_logprob - old_logprob)
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
@@ -105,9 +106,11 @@ def _icw_ppo_loss(
     actor_loss = -torch.mean(torch.minimum(surrogate_1, surrogate_2))
     critic_loss = F.mse_loss(value, returns)
     entropy_loss = -torch.mean(entropy)
-    total_loss = actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss
+    total_loss = (
+        actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss + agent.logit_reg_coef * logit_reg
+    )
     approx_kl = torch.mean(old_logprob - new_logprob)
-
+    
     return {
         "total_loss": total_loss,
         "actor_loss": actor_loss,
@@ -115,9 +118,14 @@ def _icw_ppo_loss(
         "entropy_loss": entropy_loss,
         "approx_kl": approx_kl,
         "ratio_mean": torch.mean(ratio),
-        "ratio_std": torch.std(ratio, unbiased=False) if ratio.numel() > 1 else torch.zeros((), device=ratio.device, dtype=ratio.dtype),
+        "ratio_std": (
+            torch.std(ratio, unbiased=False)
+            if ratio.numel() > 1
+            else torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+        ),
         "ratio_min": torch.min(ratio),
         "ratio_max": torch.max(ratio),
+        "logit_reg": logit_reg,
     }
 
 
@@ -149,6 +157,7 @@ def _update_icw_from_episode_ppo(
             "adv_std": 0.0,
             "adv_min": 0.0,
             "adv_max": 0.0,
+            "logit_reg": 0.0,
             "updates": 0.0,
         }
 
@@ -181,6 +190,7 @@ def _update_icw_from_episode_ppo(
         "adv_std": 0.0,
         "adv_min": 0.0,
         "adv_max": 0.0,
+        "logit_reg": 0.0,
         "updates": 0.0,
     }
 
@@ -282,20 +292,24 @@ def _update_icw_from_episode_ppo(
                 stats["actor_loss"] += float(loss_dict["actor_loss"].detach().cpu())
                 stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
                 stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
+                if "logit_reg" in loss_dict:
+                    stats["logit_reg"] += float(loss_dict["logit_reg"].detach().cpu())
                 stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
                 stats["ratio_mean"] += float(loss_dict["ratio_mean"].detach().cpu())
                 stats["ratio_std"] += float(loss_dict["ratio_std"].detach().cpu())
                 stats["ratio_min"] += float(loss_dict["ratio_min"].detach().cpu())
                 stats["ratio_max"] += float(loss_dict["ratio_max"].detach().cpu())
                 stats["adv_mean"] += float(adv_slice.mean().detach().cpu())
-                stats["adv_std"] += float(adv_slice.std(unbiased=False).detach().cpu()) if adv_slice.numel() > 1 else 0.0
+                stats["adv_std"] += (
+                    float(adv_slice.std(unbiased=False).detach().cpu()) if adv_slice.numel() > 1 else 0.0
+                )
                 stats["adv_min"] += float(adv_slice.min().detach().cpu())
                 stats["adv_max"] += float(adv_slice.max().detach().cpu())
                 stats["updates"] += 1.0
 
                 if target_kl is not None and float(target_kl) > 0.0:
                     approx_kl = float(loss_dict["approx_kl"].detach().cpu())
-                    if approx_kl > float(target_kl):
+                    if abs(approx_kl) > float(target_kl):
                         stop_group_updates = True
                         break
             if stop_group_updates:
@@ -316,6 +330,7 @@ def _update_icw_from_episode_ppo(
             "adv_std",
             "adv_min",
             "adv_max",
+            "logit_reg",
         ]:
             stats[key] /= stats["updates"]
 
@@ -324,20 +339,6 @@ def _update_icw_from_episode_ppo(
 
 def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool = False) -> ICW:
     demo.set_seed(args.seed)
-    print(
-        f"Training config (PPO) | deepic_lr={args.deepic_lr:.1e} | "
-        f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
-        f"ppo_epochs={getattr(args, 'ppo_epochs', 8)} | "
-        f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f} | "
-        f"actor_lr={getattr(args, 'ppo_actor_lr', 2e-4):.1e} | "
-        f"critic_lr={getattr(args, 'ppo_critic_lr', 1e-4):.1e} | "
-        f"vf_coef={getattr(args, 'ppo_value_coef', 0.1):.3f} | "
-        f"target_kl={getattr(args, 'ppo_target_kl', 0.02):.4f} | "
-        f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
-        f"surrogate_model={multisource._surrogate_model_name(args)}"
-    )
-
-    pretrain_cache = multisource.pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
     epoch_mean_rewards: list[float] = []
     epoch_mean_total_losses: list[float] = []
@@ -347,14 +348,33 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     best_epoch_mean_reward = float("-inf")
 
     model = _build_icw(args)
-    ppo_actor_lr = float(getattr(args, "ppo_actor_lr", 2e-4))
+
+    ppo_actor_lr = 1e-4
     ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 1e-4))
+    ppo_epochs = 4
+    ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
+    ppo_clip_eps = 0.1
+    ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.1))
+    ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
+    ppo_gae_lambda = float(getattr(args, "ppo_gae_lambda", 0.95))
+    ppo_grad_clip = float(getattr(args, "ppo_grad_clip", 1.0))
+    ppo_target_kl = 0.01
+
+    print(
+        f"Training config (PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
+        f"ppo_epochs={ppo_epochs} | ppo_clip_eps={ppo_clip_eps:.3f} | "
+        f"actor_lr={ppo_actor_lr:.1e} | critic_lr={ppo_critic_lr:.1e} | "
+        f"vf_coef={ppo_value_coef:.3f} | target_kl={ppo_target_kl:.4f} | "
+        f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
+        f"surrogate_model={multisource._surrogate_model_name(args)}"
+    )
+
+    pretrain_cache = multisource.pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     optimizer = multisource._build_ppo_optimizer(
         model=model,
         actor_lr=ppo_actor_lr,
         critic_lr=ppo_critic_lr,
     )
-
     if args.start_epoch > 0:
         checkpoint_path = _epoch_checkpoint_path(target_problem, args.start_epoch, self_train_only=self_train_only)
         if checkpoint_path.exists():
@@ -362,15 +382,6 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             print(f"Loaded model from {checkpoint_path.name}")
         else:
             print(f"Checkpoint {checkpoint_path.name} not found, starting from scratch")
-
-    ppo_epochs = int(getattr(args, "ppo_epochs", 8))
-    ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
-    ppo_clip_eps = float(getattr(args, "ppo_clip_eps", 0.2))
-    ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.1))
-    ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
-    ppo_gae_lambda = float(getattr(args, "ppo_gae_lambda", 0.95))
-    ppo_grad_clip = float(getattr(args, "ppo_grad_clip", 1.0))
-    ppo_target_kl = float(getattr(args, "ppo_target_kl", 0.02))
 
     for epoch in range(args.start_epoch, multisource.TRAIN_EPOCHS):
         print(f"Epoch {epoch + 1}/{multisource.TRAIN_EPOCHS}")
@@ -455,8 +466,8 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                         episode_trajectory[-1]["next_value"] = current_value
                         episode_trajectory[-1]["done"] = 0.0
 
-                    selected_idx, _, _ = select_indices_from_action(
-                        action=act_out["action"][0],
+                    selected_idx, _, _ = select_indices_from_action(  # type: ignore
+                        action=act_out["action_weights"][0],
                         archive_y=archive_y_t,
                         offspring_pred=offspring_pred,
                         offspring_sigma=offspring_sigma,
@@ -500,6 +511,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                             "lower": problem.lower,
                             "upper": problem.upper,
                             "action": act_out["action"][0].detach().cpu(),
+                            "action_weights": act_out["action_weights"][0].detach().cpu(),
                             "old_logprob": float(act_out["logprob"][0].detach().cpu()),
                             "value": current_value,
                             "next_value": 0.0,
@@ -548,6 +560,17 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                 )
                 action_mean = action_matrix.mean(axis=0)
                 action_std = action_matrix.std(axis=0)
+
+                weight_matrix = np.stack(
+                    [
+                        sample["action_weights"].numpy().astype(np.float32, copy=False)
+                        for sample in dim_trajectories
+                    ],
+                    axis=0,
+                )
+                weight_mean = weight_matrix.mean(axis=0)
+                weight_std = weight_matrix.std(axis=0)
+
                 loss_stats = _update_icw_from_episode_ppo(
                     model=model,
                     optimizer=optimizer,
@@ -571,7 +594,9 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
                     f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
                     f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f}, "
-                    f"action_mean={_format_vector(action_mean)}, action_std={_format_vector(action_std)}"
+                    f"logit_reg={loss_stats.get('logit_reg', 0.0):.6f}, "
+                    f"action_mean={_format_vector(action_mean)}, action_std={_format_vector(action_std)} | "
+                    f"weight_mean={_format_vector(weight_mean)}, weight_std={_format_vector(weight_std)}"
                 )
 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
@@ -627,6 +652,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             "ppo_gae_lambda": ppo_gae_lambda,
             "ppo_grad_clip": ppo_grad_clip,
             "ppo_target_kl": ppo_target_kl,
+            "ppo_logit_reg_coef": model.logit_reg_coef,
             "criterion_names": list(CRITERION_NAMES),
             "lower_better_criteria": list(LOWER_BETTER_CRITERIA),
             "records": reward_records,
@@ -777,8 +803,8 @@ def run_saea_icw_problem(
                 deterministic=True,
             )
 
-        selected_idx, _, _ = select_indices_from_action(
-            action=act_out["action"][0],
+        selected_idx, _, _ = select_indices_from_action(  # type: ignore
+            action=act_out["action_weights"][0],
             archive_y=archive_y,
             offspring_pred=offspring_pred,
             offspring_sigma=offspring_sigma,

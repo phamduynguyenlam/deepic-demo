@@ -24,11 +24,17 @@ class ICW(_DeepICBase):
         ff_dim: int = 256,
         dropout: float = 0.0,
         action_dim: int = 5,
+        action_logit_clip: float | None = 2.0,
+        softmax_temperature: float = 2.0,
+        logit_reg_coef: float = 1e-3,
     ):
         super().__init__(hidden_dim=hidden_dim, n_heads=n_heads, ff_dim=ff_dim, dropout=dropout)
         self.action_dim = int(action_dim)
         state_dim = 2 * hidden_dim + 1
         trunk_dim = hidden_dim // 2
+        self.action_logit_clip = action_logit_clip
+        self.softmax_temperature = float(softmax_temperature)
+        self.logit_reg_coef = float(logit_reg_coef)
 
         self.shared = nn.Sequential(
             nn.LayerNorm(state_dim),
@@ -49,6 +55,32 @@ class ICW(_DeepICBase):
     @staticmethod
     def _ensure_action_batch(action: torch.Tensor) -> torch.Tensor:
         return action.unsqueeze(0) if action.dim() == 1 else action
+
+    def process_action_logits(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
+        raw_logits = action
+
+        if self.action_logit_clip is not None:
+            logits = torch.clamp(
+                raw_logits,
+                -float(self.action_logit_clip),
+                float(self.action_logit_clip),
+            )
+        else:
+            logits = raw_logits
+
+        temperature = max(float(self.softmax_temperature), 1e-6)
+        weights = torch.softmax(logits / temperature, dim=-1)
+
+        logit_reg = torch.mean(raw_logits.pow(2))
+
+        return {
+            "raw_logits": raw_logits,
+            "logits": logits,
+            "weights": weights,
+            "action_logits": logits,
+            "action_weights": weights,
+            "logit_reg": logit_reg,
+        }
 
     def encode(
         self,
@@ -125,11 +157,15 @@ class ICW(_DeepICBase):
         decoded = self.decode_state(state)
         dist = Independent(Normal(decoded["mu"], decoded["std"]), 1)
         action = decoded["mu"] if deterministic else dist.rsample()
+        processed = self.process_action_logits(action)
         logprob = dist.log_prob(action)
         entropy = dist.entropy()
         decoded.update(
             {
                 "action": action,
+                "action_logits": processed["logits"],
+                "action_weights": processed["weights"],
+                "logit_reg": processed["logit_reg"],
                 "logprob": logprob,
                 "entropy": entropy,
             }
@@ -143,12 +179,16 @@ class ICW(_DeepICBase):
     ) -> dict[str, torch.Tensor]:
         decoded = self.decode_state(state)
         action = self._ensure_action_batch(action).to(device=decoded["mu"].device, dtype=decoded["mu"].dtype)
+        processed = self.process_action_logits(action)
         dist = Independent(Normal(decoded["mu"], decoded["std"]), 1)
         logprob = dist.log_prob(action)
         entropy = dist.entropy()
         decoded.update(
             {
                 "action": action,
+                "action_logits": processed["logits"],
+                "action_weights": processed["weights"],
+                "logit_reg": processed["logit_reg"],
                 "logprob": logprob,
                 "entropy": entropy,
             }
