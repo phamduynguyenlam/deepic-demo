@@ -926,6 +926,10 @@ def ppo_loss(
         "critic_loss": critic_loss,
         "entropy_loss": entropy_loss,
         "approx_kl": approx_kl,
+        "ratio_mean": torch.mean(ratio),
+        "ratio_std": torch.std(ratio, unbiased=False) if ratio.numel() > 1 else torch.zeros((), device=ratio.device, dtype=ratio.dtype),
+        "ratio_min": torch.min(ratio),
+        "ratio_max": torch.max(ratio),
     }
 
 

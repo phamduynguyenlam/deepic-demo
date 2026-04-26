@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import demo
+from infill_criteria import epdi_ranking, nd_a_ranking, nd_pbi_ranking
 import multisource_eva_common as multisource
 
 
@@ -20,10 +21,8 @@ def load_module(filename: str, module_name: str):
     return module
 
 
-nda = load_module("nsga-nda.py", "nsga_nda_module")
 nsga_eic = load_module("nsga-eic.py", "nsga_eic_module")
 db_saea_agent = load_module("db-saea-agent.py", "db_saea_agent_module")
-niching_nsga = load_module("niching_nsga.py", "niching_nsga_module")
 
 DBSAEAMetaPolicy = db_saea_agent.DBSAEAMetaPolicy
 GlobalReplayBuffer = db_saea_agent.GlobalReplayBuffer
@@ -224,115 +223,6 @@ def _generate_surrogate_population(problem, surrogates, archive_x: np.ndarray, a
     return offspring_x.astype(np.float32), offspring_pred.astype(np.float32), offspring_sigma
 
 
-def _nda_seed_ranking(offspring_pred: np.ndarray, offspring_sigma: np.ndarray) -> np.ndarray:
-    top = nda.select_nda(offspring_pred, offspring_sigma, k=1)
-    lcb = np.argsort((offspring_pred + offspring_sigma).sum(axis=1)).astype(np.int64)
-    if top.size == 0:
-        return lcb
-    rest = lcb[lcb != int(top[0])]
-    return np.concatenate([top.astype(np.int64), rest.astype(np.int64)])
-
-
-def _objective_diversity_ranking(archive_y: np.ndarray, offspring_pred: np.ndarray) -> np.ndarray:
-    if archive_y.size == 0:
-        return np.arange(offspring_pred.shape[0], dtype=np.int64)
-    dist = np.linalg.norm(offspring_pred[:, None, :] - archive_y[None, :, :], axis=2)
-    min_dist = dist.min(axis=1)
-    return np.argsort(-min_dist).astype(np.int64)
-
-
-def _merge_primary_with_fallback(primary: np.ndarray, fallback: np.ndarray) -> np.ndarray:
-    primary = np.asarray(primary, dtype=np.int64).reshape(-1)
-    fallback = np.asarray(fallback, dtype=np.int64).reshape(-1)
-    if primary.size == 0:
-        return fallback
-    mask = ~np.isin(fallback, primary)
-    return np.concatenate([primary, fallback[mask]])
-
-
-def _nd_pbi_ranking(archive_y: np.ndarray, offspring_pred: np.ndarray, offspring_sigma: np.ndarray, focus: str) -> np.ndarray:
-    penalized = offspring_pred + offspring_sigma
-    top = niching_nsga._nd_pbi_select(penalized, archive_y, k=1, focus=focus)
-    fallback = np.argsort(penalized.sum(axis=1)).astype(np.int64)
-    return _merge_primary_with_fallback(top, fallback)
-
-
-def _random_unit_reference_vector(n_obj: int, rng: np.random.Generator) -> np.ndarray:
-    vec = rng.random(n_obj, dtype=np.float32)
-    norm = np.linalg.norm(vec)
-    if norm <= 1e-12:
-        return np.full(n_obj, 1.0 / np.sqrt(max(n_obj, 1)), dtype=np.float32)
-    return (vec / norm).astype(np.float32)
-
-
-def _pd_value(values: np.ndarray, ref_vector: np.ndarray, theta: float = 5.0) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    ref_vector = np.asarray(ref_vector, dtype=np.float32)
-    ref_norm = np.linalg.norm(ref_vector)
-    if ref_norm <= 1e-12:
-        ref_vector = np.full(ref_vector.shape[0], 1.0 / np.sqrt(max(ref_vector.shape[0], 1)), dtype=np.float32)
-        ref_norm = np.linalg.norm(ref_vector)
-
-    d1 = (values @ ref_vector) / max(ref_norm, 1e-12)
-    projection = (d1 / max(ref_norm, 1e-12))[:, None] * ref_vector[None, :]
-    d2 = np.linalg.norm(values - projection, axis=1)
-    return d1 + float(theta) * d2
-
-
-def _epdi_statistics(
-    archive_y: np.ndarray,
-    offspring_pred: np.ndarray,
-    offspring_sigma: np.ndarray,
-    mc_samples: int,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    archive_fronts, _ = demo.fast_non_dominated_sort(archive_y)
-    archive_front = archive_y[np.asarray(archive_fronts[0], dtype=np.int64)] if archive_fronts and archive_fronts[0] else archive_y
-    n_obj = offspring_pred.shape[1]
-    mean_epdi = np.zeros(offspring_pred.shape[0], dtype=np.float32)
-    std_epdi = np.zeros(offspring_pred.shape[0], dtype=np.float32)
-
-    for idx in range(offspring_pred.shape[0]):
-        ref_vector = _random_unit_reference_vector(n_obj, rng)
-        pd_min = float(np.min(_pd_value(archive_front, ref_vector))) if archive_front.size else 0.0
-        sigma = np.maximum(offspring_sigma[idx], 1e-6)
-        samples = rng.normal(
-            loc=offspring_pred[idx],
-            scale=sigma,
-            size=(mc_samples, n_obj),
-        ).astype(np.float32)
-        pdi_samples = np.maximum(pd_min - _pd_value(samples, ref_vector), 0.0)
-        mean_epdi[idx] = float(np.mean(pdi_samples))
-        std_epdi[idx] = float(np.std(pdi_samples))
-
-    return mean_epdi, std_epdi
-
-
-def _epdi_ranking(
-    archive_y: np.ndarray,
-    offspring_pred: np.ndarray,
-    offspring_sigma: np.ndarray,
-    mode: str,
-    seed: int,
-    mc_samples: int = 1000,
-) -> np.ndarray:
-    epdi_mean, epdi_std = _epdi_statistics(
-        archive_y=archive_y,
-        offspring_pred=offspring_pred,
-        offspring_sigma=offspring_sigma,
-        mc_samples=mc_samples,
-        seed=seed,
-    )
-    if mode == "exploit":
-        score = epdi_mean
-    elif mode == "explore":
-        score = epdi_mean + epdi_std
-    else:
-        raise ValueError(f"Unsupported EPDI mode: {mode}")
-    return np.argsort(-score).astype(np.int64)
-
-
 def _ranking_for_action(
     action: int,
     archive_y: np.ndarray,
@@ -344,15 +234,42 @@ def _ranking_for_action(
     if action == 0:
         raise ValueError("Action 0 is regenerate-only and should not request a ranking.")
     if action == 1:
-        return _nda_seed_ranking(offspring_pred, offspring_sigma)
+        return nd_a_ranking(
+            archive_y=archive_y,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            use_penalized=True,
+        )
     if action == 2:
-        return _nd_pbi_ranking(archive_y, offspring_pred, offspring_sigma, focus="convergence")
+        return nd_pbi_ranking(
+            archive_y=archive_y,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            focus="convergence",
+        )
     if action == 3:
-        return _nd_pbi_ranking(archive_y, offspring_pred, offspring_sigma, focus="diversity")
+        return nd_pbi_ranking(
+            archive_y=archive_y,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            focus="diversity",
+        )
     if action == 4:
-        return _epdi_ranking(archive_y, offspring_pred, offspring_sigma, mode="exploit", seed=seed)
+        return epdi_ranking(
+            archive_y=archive_y,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            mode="exploit",
+            seed=seed,
+        )
     if action == 5:
-        return _epdi_ranking(archive_y, offspring_pred, offspring_sigma, mode="explore", seed=seed)
+        return epdi_ranking(
+            archive_y=archive_y,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            mode="explore",
+            seed=seed,
+        )
     raise ValueError(f"Unsupported action id: {action}")
 
 

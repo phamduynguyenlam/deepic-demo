@@ -10,3 +10,4 @@ from .gleet_agent import GLEET_Agent
 
 from .Surr_RLDE_Agent import *
 from .deepic_agent import DeepIC, HV_DeepIC, SimplifiedDeepIC
+from .icw_agent import ICW

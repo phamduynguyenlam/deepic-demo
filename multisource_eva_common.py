@@ -542,6 +542,10 @@ def _update_deepic_from_episode_ppo(
             "critic_loss": 0.0,
             "entropy_loss": 0.0,
             "approx_kl": 0.0,
+            "ratio_mean": 0.0,
+            "ratio_std": 0.0,
+            "ratio_min": 0.0,
+            "ratio_max": 0.0,
             "adv_mean": 0.0,
             "adv_std": 0.0,
             "adv_min": 0.0,
@@ -569,6 +573,10 @@ def _update_deepic_from_episode_ppo(
         "critic_loss": 0.0,
         "entropy_loss": 0.0,
         "approx_kl": 0.0,
+        "ratio_mean": 0.0,
+        "ratio_std": 0.0,
+        "ratio_min": 0.0,
+        "ratio_max": 0.0,
         "adv_mean": 0.0,
         "adv_std": 0.0,
         "adv_min": 0.0,
@@ -678,6 +686,10 @@ def _update_deepic_from_episode_ppo(
                 stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
                 stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
                 stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
+                stats["ratio_mean"] += float(loss_dict["ratio_mean"].detach().cpu())
+                stats["ratio_std"] += float(loss_dict["ratio_std"].detach().cpu())
+                stats["ratio_min"] += float(loss_dict["ratio_min"].detach().cpu())
+                stats["ratio_max"] += float(loss_dict["ratio_max"].detach().cpu())
                 stats["adv_mean"] += float(adv_slice.mean().detach().cpu())
                 stats["adv_std"] += float(adv_slice.std(unbiased=False).detach().cpu()) if adv_slice.numel() > 1 else 0.0
                 stats["adv_min"] += float(adv_slice.min().detach().cpu())
@@ -693,7 +705,21 @@ def _update_deepic_from_episode_ppo(
                 break
 
     if stats["updates"] > 0:
-        for key in ["total_loss", "actor_loss", "critic_loss", "entropy_loss", "approx_kl", "adv_mean", "adv_std", "adv_min", "adv_max"]:
+        for key in [
+            "total_loss",
+            "actor_loss",
+            "critic_loss",
+            "entropy_loss",
+            "approx_kl",
+            "ratio_mean",
+            "ratio_std",
+            "ratio_min",
+            "ratio_max",
+            "adv_mean",
+            "adv_std",
+            "adv_min",
+            "adv_max",
+        ]:
             stats[key] /= stats["updates"]
 
     return stats
@@ -1171,6 +1197,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                     f"({len(dim_trajectories)} rollout steps), total_loss={loss_stats['total_loss']:.6f}, "
                     f"actor={loss_stats['actor_loss']:.6f}, critic={loss_stats['critic_loss']:.6f}, "
                     f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}, "
+                    f"ratio_mean={loss_stats['ratio_mean']:.6f}, ratio_std={loss_stats['ratio_std']:.6f}, "
+                    f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
                     f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
                     f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f}"
                 )
