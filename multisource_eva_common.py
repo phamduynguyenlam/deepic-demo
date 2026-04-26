@@ -622,6 +622,8 @@ def _update_deepic_from_episode_ppo(
             dtype=demo.torch.float32,
             device=device,
         )
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
 
         stop_group_updates = False
         for _ in range(max(int(ppo_epochs), 1)):
@@ -921,10 +923,10 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
     print(
         f"Training config (PPO) | "
         f"surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
-        f"ppo_epochs={getattr(args, 'ppo_epochs', 4)} | "
+        f"ppo_epochs={getattr(args, 'ppo_epochs', 8)} | "
         f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f} | "
-        f"actor_lr={getattr(args, 'ppo_actor_lr', 3e-4):.1e} | "
-        f"critic_lr={getattr(args, 'ppo_critic_lr', 5e-5):.1e} | "
+        f"actor_lr={getattr(args, 'ppo_actor_lr', 2e-4):.1e} | "
+        f"critic_lr={getattr(args, 'ppo_critic_lr', 1e-4):.1e} | "
         f"vf_coef={getattr(args, 'ppo_value_coef', 0.1):.3f} | "
         f"target_kl={getattr(args, 'ppo_target_kl', 0.02):.3f} | "
         f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
@@ -950,8 +952,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
     ).to(args.device)
     if not hasattr(deepic, "act") or not hasattr(deepic, "evaluate_actions"):
         raise TypeError("PPO training requires DeepICClass to implement act() and evaluate_actions().")
-    ppo_actor_lr = float(getattr(args, "ppo_actor_lr", 3e-4))
-    ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 5e-5))
+    ppo_actor_lr = float(getattr(args, "ppo_actor_lr", 2e-4))
+    ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 1e-4))
     deepic_optimizer = _build_ppo_optimizer(
         deepic,
         actor_lr=ppo_actor_lr,
@@ -966,7 +968,7 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         else:
             print(f"Checkpoint {checkpoint_path.name} not found, starting from scratch")
 
-    ppo_epochs = int(getattr(args, "ppo_epochs", 4))
+    ppo_epochs = int(getattr(args, "ppo_epochs", 8))
     ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
     ppo_clip_eps = float(getattr(args, "ppo_clip_eps", 0.2))
     ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.1))
@@ -1218,15 +1220,39 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
 
 def load_or_train_deepic(args, target_problem: str, self_train_only: bool = False):
     model_path = _final_model_path(target_problem, self_train_only=self_train_only)
+    candidate_paths: list[Path] = []
+
     if model_path.exists():
-        print(f"Using saved DeepIC model from {model_path.name}")
+        candidate_paths.append(model_path)
+
+    best_reward_path = _best_reward_model_path(
+        target_problem,
+        train_algo=getattr(args, "train_algo", "reinforce"),
+        self_train_only=self_train_only,
+    )
+    if best_reward_path.exists() and best_reward_path not in candidate_paths:
+        candidate_paths.append(best_reward_path)
+
+    for epoch_number in range(TRAIN_EPOCHS, 0, -1):
+        checkpoint_path = _epoch_checkpoint_path(target_problem, epoch_number, self_train_only=self_train_only)
+        if checkpoint_path.exists() and checkpoint_path not in candidate_paths:
+            candidate_paths.append(checkpoint_path)
+
+    for candidate_path in candidate_paths:
         deepic = demo.DeepICClass(
             hidden_dim=args.deepic_hidden,
             n_heads=args.deepic_heads,
             ff_dim=args.deepic_ff,
         ).to(args.device)
-        deepic.load_state_dict(_torch_load(model_path, args.device))
+        try:
+            deepic.load_state_dict(_torch_load(candidate_path, args.device))
+        except RuntimeError as exc:
+            print(f"Skipping incompatible DeepIC checkpoint {candidate_path.name}: {exc}")
+            continue
+
+        print(f"Using saved DeepIC model from {candidate_path.name}")
         return deepic
+
     if getattr(args, "train_algo", "reinforce") == "ppo":
         return train_deepic_multisource_ppo(args, target_problem, self_train_only=self_train_only)
     return train_deepic_multisource(args, target_problem, self_train_only=self_train_only)
@@ -1472,9 +1498,9 @@ def parse_args(target_problem: str):
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
     parser.add_argument("--discount", type=float, default=1.0, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--train_algo", type=str, default="reinforce", choices=["reinforce", "ppo"])
-    parser.add_argument("--ppo_epochs", type=int, default=4)
-    parser.add_argument("--ppo_actor_lr", type=float, default=3e-4)
-    parser.add_argument("--ppo_critic_lr", type=float, default=5e-5)
+    parser.add_argument("--ppo_epochs", type=int, default=8)
+    parser.add_argument("--ppo_actor_lr", type=float, default=2e-4)
+    parser.add_argument("--ppo_critic_lr", type=float, default=1e-4)
     parser.add_argument("--ppo_minibatch_size", type=int, default=32)
     parser.add_argument("--ppo_clip_eps", type=float, default=0.2)
     parser.add_argument("--ppo_value_coef", type=float, default=0.1)
