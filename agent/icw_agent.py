@@ -26,7 +26,7 @@ class ICW(_DeepICBase):
         action_dim: int = 5,
         action_logit_clip: float | None = 2.0,
         softmax_temperature: float = 2.0,
-        logit_reg_coef: float = 1e-3,
+        logit_reg_coef: float = 3e-3,
     ):
         super().__init__(hidden_dim=hidden_dim, n_heads=n_heads, ff_dim=ff_dim, dropout=dropout)
         self.action_dim = int(action_dim)

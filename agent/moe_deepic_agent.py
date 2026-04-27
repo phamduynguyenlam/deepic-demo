@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from agent.deepic_agent import SimplifiedDeepIC, ppo_loss
+from agent.deepic_agent import SimplifiedDeepIC
 
 
 class StateWiseMoEDecoder(nn.Module):
@@ -221,19 +221,49 @@ def moe_ppo_loss(
     balance_coef: float = 0.001,
 ) -> dict[str, torch.Tensor]:
     # Gọi hàm ppo_loss chuẩn trước để tái sử dụng logic tính toán
-    loss_dict = ppo_loss(
-        agent=agent,
-        batch=batch,
-        clip_eps=clip_eps,
-        value_coef=value_coef,
-        entropy_coef=entropy_coef,
+    eval_out = agent.evaluate_actions(
+        H_surr=batch["H_surr"],
+        H_true=batch["H_true"],
+        progress=batch["progress"],
+        actions=batch["actions"],
     )
-    
-    eval_out = agent.evaluate_actions(batch["H_surr"], batch["H_true"], batch["progress"], batch["actions"])
-    balance_loss = moe_balance_loss(eval_out["gate_weights"])
+
+    new_logprob = eval_out["logprob"]
+    entropy = eval_out["entropy"]
+    value = eval_out["value"]
+    old_logprob = batch["old_logprob"]
+    advantages = batch["advantages"]
+    returns = batch["returns"]
+
+    ratio = torch.exp(new_logprob - old_logprob)
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+    surrogate_1 = ratio * advantages
+    surrogate_2 = clipped_ratio * advantages
+    actor_loss = -torch.mean(torch.minimum(surrogate_1, surrogate_2))
+    critic_loss = F.mse_loss(value, returns)
+    entropy_loss = -torch.mean(entropy)
+    total_loss = actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss
+    approx_kl = torch.mean(old_logprob - new_logprob)
+
     gate_weights = eval_out["gate_weights"]
+    balance_loss = moe_balance_loss(gate_weights)
     gate_entropy = -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean()
-    loss_dict["total_loss"] = loss_dict["total_loss"] + balance_coef * balance_loss
-    loss_dict["balance_loss"] = balance_loss
-    loss_dict["gate_entropy"] = gate_entropy
-    return loss_dict
+    total_loss = total_loss + balance_coef * balance_loss
+
+    return {
+        "total_loss": total_loss,
+        "actor_loss": actor_loss,
+        "critic_loss": critic_loss,
+        "entropy_loss": entropy_loss,
+        "approx_kl": approx_kl,
+        "ratio_mean": torch.mean(ratio),
+        "ratio_std": (
+            torch.std(ratio, unbiased=False)
+            if ratio.numel() > 1
+            else torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+        ),
+        "ratio_min": torch.min(ratio),
+        "ratio_max": torch.max(ratio),
+        "balance_loss": balance_loss,
+        "gate_entropy": gate_entropy,
+    }
