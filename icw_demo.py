@@ -103,6 +103,7 @@ def _icw_ppo_loss(
     clip_eps: float = 0.2,
     value_coef: float = 0.1,
     entropy_coef: float = 0.01,
+    weight_kl_coef: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     eval_out = agent.evaluate_actions(
         x_true=batch["x_true"],
@@ -131,8 +132,21 @@ def _icw_ppo_loss(
     actor_loss = -torch.mean(torch.minimum(surrogate_1, surrogate_2))
     critic_loss = F.mse_loss(value, returns)
     entropy_loss = -torch.mean(entropy)
+
+    action_weights = eval_out.get("action_weights", None)
+    weight_kl = torch.zeros((), device=value.device, dtype=value.dtype)
+    weight_entropy = torch.zeros_like(weight_kl)
+    if action_weights is not None:
+        weights = action_weights.to(device=value.device, dtype=value.dtype).clamp_min(1e-8)
+        weight_entropy = -torch.sum(weights * torch.log(weights), dim=-1).mean()
+        # KL(weights || uniform) = sum_i w_i log(w_i * action_dim)
+        weight_kl = torch.sum(weights * torch.log(weights * float(weights.size(-1))), dim=-1).mean()
     total_loss = (
-        actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss + agent.logit_reg_coef * logit_reg
+        actor_loss
+        + value_coef * critic_loss
+        + entropy_coef * entropy_loss
+        + float(weight_kl_coef) * weight_kl
+        + agent.logit_reg_coef * logit_reg
     )
     approx_kl = torch.mean(old_logprob - new_logprob)
     
@@ -141,6 +155,8 @@ def _icw_ppo_loss(
         "actor_loss": actor_loss,
         "critic_loss": critic_loss,
         "entropy_loss": entropy_loss,
+        "weight_kl": weight_kl,
+        "weight_entropy": weight_entropy,
         "approx_kl": approx_kl,
         "ratio_mean": torch.mean(ratio),
         "ratio_std": (
@@ -164,8 +180,10 @@ def _update_icw_from_episode_ppo(
     clip_eps: float,
     value_coef: float,
     entropy_coef: float,
+    weight_kl_coef: float,
     grad_clip: float | None,
     target_kl: float | None,
+    adv_clip: float = 2.0,
 ) -> dict[str, float]:
     if not episode_trajectory:
         return {
@@ -173,6 +191,8 @@ def _update_icw_from_episode_ppo(
             "actor_loss": 0.0,
             "critic_loss": 0.0,
             "entropy_loss": 0.0,
+            "weight_kl": 0.0,
+            "weight_entropy": 0.0,
             "approx_kl": 0.0,
             "ratio_mean": 0.0,
             "ratio_std": 0.0,
@@ -206,6 +226,8 @@ def _update_icw_from_episode_ppo(
         "actor_loss": 0.0,
         "critic_loss": 0.0,
         "entropy_loss": 0.0,
+        "weight_kl": 0.0,
+        "weight_entropy": 0.0,
         "approx_kl": 0.0,
         "ratio_mean": 0.0,
         "ratio_std": 0.0,
@@ -276,6 +298,8 @@ def _update_icw_from_episode_ppo(
         )
         if group_size > 1:
             advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
+        if adv_clip is not None and float(adv_clip) > 0.0:
+            advantages = advantages.clamp(-float(adv_clip), float(adv_clip))
 
         stop_group_updates = False
         for _ in range(max(int(ppo_epochs), 1)):
@@ -305,6 +329,7 @@ def _update_icw_from_episode_ppo(
                     clip_eps=clip_eps,
                     value_coef=value_coef,
                     entropy_coef=entropy_coef,
+                    weight_kl_coef=weight_kl_coef,
                 )
                 optimizer.zero_grad()
                 loss_dict["total_loss"].backward()
@@ -317,6 +342,8 @@ def _update_icw_from_episode_ppo(
                 stats["actor_loss"] += float(loss_dict["actor_loss"].detach().cpu())
                 stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
                 stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
+                stats["weight_kl"] += float(loss_dict["weight_kl"].detach().cpu())
+                stats["weight_entropy"] += float(loss_dict["weight_entropy"].detach().cpu())
                 if "logit_reg" in loss_dict:
                     stats["logit_reg"] += float(loss_dict["logit_reg"].detach().cpu())
                 stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
@@ -346,6 +373,8 @@ def _update_icw_from_episode_ppo(
             "actor_loss",
             "critic_loss",
             "entropy_loss",
+            "weight_kl",
+            "weight_entropy",
             "approx_kl",
             "ratio_mean",
             "ratio_std",
@@ -375,21 +404,24 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     model = _build_icw(args)
 
     ppo_actor_lr = 1e-4
-    ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 1e-4))
+    ppo_critic_lr = 5e-5
     ppo_epochs = 4
     ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
-    ppo_clip_eps = 0.1
-    ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.1))
+    ppo_clip_eps = 0.05
+    ppo_value_coef = 0.05
     ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
+    ppo_weight_kl_coef = float(getattr(args, "icw_weight_kl_coef", 0.01))
     ppo_gae_lambda = float(getattr(args, "ppo_gae_lambda", 0.95))
     ppo_grad_clip = float(getattr(args, "ppo_grad_clip", 1.0))
-    ppo_target_kl = 0.01
+    ppo_target_kl = 0.005
+    ppo_adv_clip = float(getattr(args, "ppo_adv_clip", 2.0))
 
     print(
         f"Training config (PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
         f"ppo_epochs={ppo_epochs} | ppo_clip_eps={ppo_clip_eps:.3f} | "
         f"actor_lr={ppo_actor_lr:.1e} | critic_lr={ppo_critic_lr:.1e} | "
         f"vf_coef={ppo_value_coef:.3f} | target_kl={ppo_target_kl:.4f} | "
+        f"weight_kl_coef={ppo_weight_kl_coef:.4f} | adv_clip={ppo_adv_clip:.2f} | "
         f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
         f"surrogate_model={multisource._surrogate_model_name(args)}"
     )
@@ -606,8 +638,10 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     clip_eps=ppo_clip_eps,
                     value_coef=ppo_value_coef,
                     entropy_coef=ppo_entropy_coef,
+                    weight_kl_coef=ppo_weight_kl_coef,
                     grad_clip=ppo_grad_clip,
                     target_kl=ppo_target_kl,
+                    adv_clip=ppo_adv_clip,
                 )
                 epoch_total_losses.append(loss_stats["total_loss"])
                 print(
@@ -615,6 +649,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     f"({len(dim_trajectories)} rollout steps), total_loss={loss_stats['total_loss']:.6f}, "
                     f"actor={loss_stats['actor_loss']:.6f}, critic={loss_stats['critic_loss']:.6f}, "
                     f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}, "
+                    f"weight_kl={loss_stats.get('weight_kl', 0.0):.6f}, weight_ent={loss_stats.get('weight_entropy', 0.0):.6f}, "
                     f"ratio_mean={loss_stats['ratio_mean']:.6f}, ratio_std={loss_stats['ratio_std']:.6f}, "
                     f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
                     f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
@@ -674,9 +709,11 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             "ppo_clip_eps": ppo_clip_eps,
             "ppo_value_coef": ppo_value_coef,
             "ppo_entropy_coef": ppo_entropy_coef,
+            "ppo_weight_kl_coef": ppo_weight_kl_coef,
             "ppo_gae_lambda": ppo_gae_lambda,
             "ppo_grad_clip": ppo_grad_clip,
             "ppo_target_kl": ppo_target_kl,
+            "ppo_adv_clip": ppo_adv_clip,
             "ppo_logit_reg_coef": model.logit_reg_coef,
             "criterion_names": list(CRITERION_NAMES),
             "lower_better_criteria": list(LOWER_BETTER_CRITERIA),
