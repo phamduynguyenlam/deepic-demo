@@ -16,8 +16,33 @@ import multisource_eva_common as multisource
 import zdt1_demo as base_demo
 
 
-TARGET_PROBLEM = "ZDT1"
+DEFAULT_TARGET_PROBLEM = "ZDT1"
 EPDI_MC_SAMPLES = 128
+
+
+def _consume_target_problem(default: str = DEFAULT_TARGET_PROBLEM) -> str:
+    argv = sys.argv
+    for flag in ("--problem", "--target_problem"):
+        if flag in argv:
+            idx = argv.index(flag)
+            if idx + 1 < len(argv):
+                problem = str(argv[idx + 1])
+                del argv[idx : idx + 2]
+                return problem
+
+    if len(argv) > 1 and not str(argv[1]).startswith("-"):
+        problem = str(argv[1])
+        del argv[1]
+        return problem
+
+    return str(default)
+
+
+def _pretrain_target_surrogates(args, problem_name: str) -> dict:
+    cache: dict = {}
+    for dim in multisource.SOURCE_DIMS:
+        cache[(problem_name, dim)] = multisource.load_or_prepare_kan_surrogate(problem_name, dim, args)
+    return cache
 
 
 def _problem_slug(problem_name: str) -> str:
@@ -369,7 +394,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
         f"surrogate_model={multisource._surrogate_model_name(args)}"
     )
 
-    pretrain_cache = multisource.pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
+    pretrain_cache = _pretrain_target_surrogates(args, target_problem)
     optimizer = multisource._build_ppo_optimizer(
         model=model,
         actor_lr=ppo_actor_lr,
@@ -392,7 +417,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             dim_trajectories: list[dict] = []
             dim_problem_count = 0
 
-            for problem_name in multisource.training_problems_for(target_problem, self_train_only=self_train_only):
+            for problem_name in [target_problem]:
                 entry = pretrain_cache[(problem_name, dim)]
                 problem = entry["problem"]
                 surrogates = entry["models"]
@@ -629,11 +654,11 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     multisource._save_reward_log(
         reward_log_path,
         {
-            "script": "icw_zdt1_demo.py",
+            "script": "icw_demo.py",
             "mode": "train_icw_multisource_ppo",
             "target_problem": target_problem,
             "model_path": str(model_path),
-            "training_problems": multisource.training_problems_for(target_problem, self_train_only=self_train_only),
+            "training_problems": [target_problem],
             "source_dims": multisource.SOURCE_DIMS,
             "training_label": "iwc_self_only" if self_train_only else "iwc_source_mix",
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
@@ -952,30 +977,25 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False) -> 
     )
 
 
-def _parse_args():
-    args = multisource.parse_args(TARGET_PROBLEM)
+def _parse_args(target_problem: str):
+    args = multisource.parse_args(target_problem)
     if "--train_algo" not in sys.argv[1:]:
         args.train_algo = "ppo"
     return args
 
 
 def main():
-    args = _parse_args()
+    target_problem = _consume_target_problem()
+    args = _parse_args(target_problem)
     if args.dim != 30:
-        print(f"Warning: expected 30D evaluation for {TARGET_PROBLEM}, but received dim={args.dim}.")
-
-    if args.archive_size != base_demo.INITIAL_SURROGATE_ARCHIVE_SIZE:
-        print(
-            f"Warning: this demo initializes a surrogate archive of {base_demo.INITIAL_SURROGATE_ARCHIVE_SIZE} "
-            f"individuals while archive_size={args.archive_size}."
-        )
+        print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
     if args.train_only:
         if args.train_algo != "ppo":
-            raise ValueError("icw_zdt1_demo.py currently supports PPO training only.")
-        train_icw_multisource_ppo(args, TARGET_PROBLEM, self_train_only=True)
+            raise ValueError("icw_demo.py currently supports PPO training only.")
+        train_icw_multisource_ppo(args, target_problem, self_train_only=True)
     else:
-        run_comparison(args, TARGET_PROBLEM, self_train_only=True)
+        run_comparison(args, target_problem, self_train_only=True)
 
 
 if __name__ == "__main__":
