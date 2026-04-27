@@ -289,7 +289,7 @@ def _compute_reward(
             d_i = float(distances[nearest_idx])
             d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
             reward += d_i / max(d_ref_i, 1e-12)
-        return float(reward)
+        return float(10.0 * reward)
 
     if int(reward_scheme) != 3:
         raise ValueError(f"Unsupported reward_scheme: {reward_scheme}")
@@ -1521,9 +1521,15 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False):
     )
 
 
-def parse_args(target_problem: str):
+def parse_args(target_problem: str, argv=None):
     parser = argparse.ArgumentParser(
         description=f"Train SAEA-DeepIC on 15D/20D/25D source problems and evaluate on 30D {target_problem}"
+    )
+    parser.add_argument(
+        "--problem",
+        type=str,
+        default=target_problem,
+        help="Target problem name (e.g., ZDT1, ZDT2, ZDT3, DTLZ2).",
     )
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
@@ -1583,18 +1589,19 @@ def parse_args(target_problem: str):
         help="Start training from this epoch checkpoint number, if it exists.",
     )
     parser.add_argument("--train_only", action="store_true", help="Only train the mixed-source DeepIC model")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main_for_problem(target_problem: str, self_train_only: bool = False):
     args = parse_args(target_problem)
+    effective_problem = str(getattr(args, "problem", target_problem))
     if args.dim != 30:
-        print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
+        print(f"Warning: expected 30D evaluation for {effective_problem}, but received dim={args.dim}.")
 
     if args.train_only:
         if args.train_algo == "ppo":
-            train_deepic_multisource_ppo(args, target_problem, self_train_only=self_train_only)
+            train_deepic_multisource_ppo(args, effective_problem, self_train_only=self_train_only)
         else:
-            train_deepic_multisource(args, target_problem, self_train_only=self_train_only)
+            train_deepic_multisource(args, effective_problem, self_train_only=self_train_only)
     else:
-        run_comparison(args, target_problem, self_train_only=self_train_only)
+        run_comparison(args, effective_problem, self_train_only=self_train_only)

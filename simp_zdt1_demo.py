@@ -8,7 +8,7 @@ from agent.deepic_agent import SimplifiedDeepIC
 
 import demo
 import multisource_eva_common as multisource
-import zdt1_demo as base_demo
+import deepic_demo as base_demo
 
 
 TARGET_PROBLEM = "ZDT1"

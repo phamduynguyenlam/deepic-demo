@@ -13,7 +13,7 @@ from infill_criteria import CRITERION_NAMES, LOWER_BETTER_CRITERIA, select_indic
 
 import demo
 import multisource_eva_common as multisource
-import zdt1_demo as base_demo
+import deepic_demo as base_demo
 
 
 DEFAULT_TARGET_PROBLEM = "ZDT1"

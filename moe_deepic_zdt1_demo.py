@@ -11,7 +11,7 @@ from agent.moe_deepic_agent import MoE_SimplifiedDeepIC, moe_ppo_loss
 
 import demo
 import multisource_eva_common as multisource
-import zdt1_demo as base_demo
+import deepic_demo as base_demo
 
 
 TARGET_PROBLEM = "ZDT1"
@@ -468,6 +468,7 @@ def train_moe_deepic_multisource_ppo(args, target_problem: str, self_train_only:
                             "done": 1.0,
                             "reward": reward_value,
                             "gate_weights": act_out["gate_weights"][0].detach().cpu(),
+                            "expert_logits": act_out["expert_logits"][0].detach().cpu(),
                         }
                     )
 
@@ -511,6 +512,22 @@ def train_moe_deepic_multisource_ppo(args, target_problem: str, self_train_only:
                 )
                 gate_mean = gate_matrix.mean(axis=0)
                 gate_std = gate_matrix.std(axis=0)
+                gate_top1 = gate_matrix.argmax(axis=1)
+                top1_gate_usage = np.bincount(gate_top1, minlength=gate_matrix.shape[1]).astype(np.float32)
+                top1_gate_usage = top1_gate_usage / max(float(gate_top1.size), 1.0)
+
+                expert_matrix = np.stack(
+                    [
+                        sample["expert_logits"].detach().cpu().numpy().astype(np.float32, copy=False)
+                        for sample in dim_trajectories
+                    ],
+                    axis=0,
+                )  # (T, N, E)
+                expert_mean = expert_matrix.mean(axis=(0, 1))
+                expert_std = expert_matrix.std(axis=(0, 1))
+                expert_flat = expert_matrix.reshape(-1, expert_matrix.shape[-1])
+                expert_corr = np.corrcoef(expert_flat, rowvar=False)
+                expert_corr = np.nan_to_num(expert_corr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
                 loss_stats = _update_moe_from_episode_ppo(
                     model=model,
@@ -539,7 +556,10 @@ def train_moe_deepic_multisource_ppo(args, target_problem: str, self_train_only:
                     f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
                     f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
                     f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f} | "
-                    f"gate_mean={_format_vector(gate_mean)}, gate_std={_format_vector(gate_std)}"
+                    f"gate_mean={_format_vector(gate_mean)}, gate_std={_format_vector(gate_std)} | "
+                    f"top1_gate_usage={_format_vector(top1_gate_usage)} | "
+                    f"expert_mean={_format_vector(expert_mean)}, expert_std={_format_vector(expert_std)} | "
+                    f"expert_corr={np.array2string(expert_corr, precision=3, separator=', ', suppress_small=False)}"
                 )
 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
