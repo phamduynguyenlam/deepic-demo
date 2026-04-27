@@ -965,8 +965,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         f"ppo_epochs={getattr(args, 'ppo_epochs', 8)} | "
         f"ppo_clip_eps={getattr(args, 'ppo_clip_eps', 0.2):.3f} | "
         f"actor_lr={getattr(args, 'ppo_actor_lr', 2e-4):.1e} | "
-        f"critic_lr={getattr(args, 'ppo_critic_lr', 1e-4):.1e} | "
-        f"vf_coef={getattr(args, 'ppo_value_coef', 0.1):.3f} | "
+        f"critic_lr={getattr(args, 'ppo_critic_lr', 5e-5):.1e} | "
+        f"vf_coef={getattr(args, 'ppo_value_coef', 0.03):.3f} | "
         f"target_kl={getattr(args, 'ppo_target_kl', 0.02):.3f} | "
         f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
         f"surrogate_model={_surrogate_model_name(args)}"
@@ -1023,12 +1023,12 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
 
     ppo_epochs = int(getattr(args, "ppo_epochs", 8))
     ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
-    ppo_clip_eps = float(getattr(args, "ppo_clip_eps", 0.2))
+    ppo_clip_eps = float(getattr(args, "ppo_clip_eps", 0.1))
     ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.1))
     ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
     ppo_gae_lambda = float(getattr(args, "ppo_gae_lambda", 0.95))
     ppo_grad_clip = float(getattr(args, "ppo_grad_clip", 1.0))
-    ppo_target_kl = float(getattr(args, "ppo_target_kl", 0.02))
+    ppo_target_kl = float(getattr(args, "ppo_target_kl", 0.01))
 
     for epoch in range(args.start_epoch, TRAIN_EPOCHS):
         print(f"Epoch {epoch + 1}/{TRAIN_EPOCHS}")
