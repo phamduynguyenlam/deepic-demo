@@ -14,7 +14,7 @@ import multisource_eva_common as multisource
 import deepic_demo as base_demo
 
 
-TARGET_PROBLEM = "ZDT1"
+DEFAULT_TARGET_PROBLEM = "ZDT1"
 
 
 def _problem_slug(problem_name: str) -> str:
@@ -843,7 +843,7 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False) -> 
 
 
 def _parse_args():
-    args = multisource.parse_args(TARGET_PROBLEM)
+    args = multisource.parse_args(DEFAULT_TARGET_PROBLEM)
     if "--train_algo" not in sys.argv[1:]:
         args.train_algo = "ppo"
     return args
@@ -851,8 +851,9 @@ def _parse_args():
 
 def main():
     args = _parse_args()
+    target_problem = str(getattr(args, "problem", DEFAULT_TARGET_PROBLEM))
     if args.dim != 30:
-        print(f"Warning: expected 30D evaluation for {TARGET_PROBLEM}, but received dim={args.dim}.")
+        print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
     if args.archive_size != base_demo.INITIAL_SURROGATE_ARCHIVE_SIZE:
         print(
@@ -861,9 +862,9 @@ def main():
         )
 
     if args.train_only:
-        train_moe_deepic_multisource_ppo(args, TARGET_PROBLEM, self_train_only=True)
+        train_moe_deepic_multisource_ppo(args, target_problem, self_train_only=True)
     else:
-        run_comparison(args, TARGET_PROBLEM, self_train_only=True)
+        run_comparison(args, target_problem, self_train_only=True)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import demo
-from agent.deepic_agent import ppo_loss as deepic_ppo_loss
+from agent.deepic_agent import SimplifiedDeepIC, ppo_loss as deepic_ppo_loss
 from problem.kan import KAN
 
 
@@ -990,7 +990,16 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         ff_dim=args.deepic_ff,
     ).to(args.device)
     if not hasattr(deepic, "act") or not hasattr(deepic, "evaluate_actions"):
-        raise TypeError("PPO training requires DeepICClass to implement act() and evaluate_actions().")
+        print(
+            "Warning: demo.DeepICClass does not implement act()/evaluate_actions(); "
+            "falling back to SimplifiedDeepIC for PPO training."
+        )
+        deepic = SimplifiedDeepIC(
+            hidden_dim=args.deepic_hidden,
+            n_heads=args.deepic_heads,
+            ff_dim=args.deepic_ff,
+            dropout=float(getattr(args, "deepic_dropout", 0.0)),
+        ).to(args.device)
     ppo_actor_lr = float(getattr(args, "ppo_actor_lr", 2e-4))
     ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 1e-4))
     deepic_optimizer = _build_ppo_optimizer(
@@ -1002,8 +1011,13 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
     if args.start_epoch > 0:
         checkpoint_path = _epoch_checkpoint_path(target_problem, args.start_epoch, self_train_only=self_train_only)
         if checkpoint_path.exists():
-            deepic.load_state_dict(_torch_load(checkpoint_path, args.device))
-            print(f"Loaded model from {checkpoint_path.name}")
+            try:
+                deepic.load_state_dict(_torch_load(checkpoint_path, args.device))
+            except RuntimeError as exc:
+                print(f"Checkpoint {checkpoint_path.name} incompatible with PPO agent: {exc}")
+                print("Starting from scratch.")
+            else:
+                print(f"Loaded model from {checkpoint_path.name}")
         else:
             print(f"Checkpoint {checkpoint_path.name} not found, starting from scratch")
 
