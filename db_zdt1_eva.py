@@ -548,33 +548,15 @@ def train_db_multisource(args):
         f"max_fe={args.max_fe} | max_a1_actions={args.max_a1_actions}"
     )
     _ensure_worker_surrogates_ready(args)
-    if ray is None:
-        raise ImportError("Ray is not installed. Install ray to train DB-SAEA with 24 parallel environments.")
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
 
     task_names = _all_task_names()
-    num_workers = max(1, min(int(args.num_workers), len(task_names)))
     rollout_steps = int(args.max_a1_actions + max(args.max_fe - args.archive_size, 0))
-    print(
-        f"Distributed training | num_workers={num_workers} | "
-        f"task_count={len(task_names)} | rollout_steps={rollout_steps}"
-    )
+    print(f"Local DQN training (no Ray) | task_count={len(task_names)} | rollout_steps={rollout_steps}")
 
-    replay_actor_cls = build_global_replay_buffer_actor()
-    worker_actor_cls = build_db_saea_rollout_worker(policy_kwargs=_policy_kwargs(args))
-    replay = replay_actor_cls.remote(capacity=args.replay_capacity)
-
-    def env_factory(task_name: str, worker_id: int):
-        return DBSAEATaskEnv(task_name=task_name, worker_id=worker_id, args=args)
-
-    workers = [
-        worker_actor_cls.remote(
-            worker_id=idx,
-            env_factory=env_factory,
-            replay_buffer=replay,
-        )
-        for idx in range(num_workers)
+    replay = GlobalReplayBuffer(capacity=args.replay_capacity)
+    envs = [
+        DBSAEATaskEnv(task_name=task_name, worker_id=idx, args=args)
+        for idx, task_name in enumerate(task_names)
     ]
 
     learner = DistributedLearner(
@@ -588,7 +570,9 @@ def train_db_multisource(args):
     epoch_mean_losses: list[float] = []
     epsilon = float(args.epsilon_start)
     update_count = 0
-    task_interact_counts: dict[str, int] = {task_name: int(args.start_epoch) for task_name in task_names}
+
+    local_policy = DBSAEAMetaPolicy(**_policy_kwargs(args)).cpu()
+    local_policy.eval()
 
     if args.start_epoch > 0:
         checkpoint_path = epoch_model_path(args.start_epoch)
@@ -604,69 +588,65 @@ def train_db_multisource(args):
         epoch_reward_sum = 0.0
         epoch_reward_count = 0
         epoch_losses: list[float] = []
-        worker_reward_sums: list[float] = []
         current_weights = learner.state_dict_cpu()
+        local_policy.load_state_dict(current_weights)
         total_transitions = 0
-        for batch_start in range(0, len(task_names), num_workers):
-            task_batch = task_names[batch_start : batch_start + num_workers]
-            rollout_futures = [
-                workers[slot].collect_trajectories.remote(
-                    weights=current_weights,
-                    epsilon=epsilon,
-                    max_steps=rollout_steps,
-                    task_name=task_name,
-                )
-                for slot, task_name in enumerate(task_batch)
-            ]
-            rollout_summaries = ray.get(rollout_futures)
 
-            for summary in rollout_summaries:
-                task_name = str(summary.get("task_name"))
-                transition_count = int(summary.get("transition_count", 0))
-                reward_sum = float(summary.get("reward_sum", 0.0))
-                stats = summary.get("episode_stats", {})
-                task_interact_counts[task_name] = int(task_interact_counts.get(task_name, int(args.start_epoch))) + 1
-                global_interact_index = int(task_interact_counts[task_name])
-                total_transitions += transition_count
-                epoch_reward_sum += reward_sum
-                epoch_reward_count += transition_count
-                worker_reward_sums.append(reward_sum)
-                reward_records.append(
-                    {
-                        "epoch": epoch + 1,
-                        "task_name": task_name,
-                        "task_interact_index": global_interact_index,
-                        "problem": stats.get("problem_name"),
-                        "dim": stats.get("dim"),
-                        "transition_count": transition_count,
-                        "reward_sum": reward_sum,
-                        "reward_mean": reward_sum / max(transition_count, 1),
-                        "true_evals": stats.get("true_evals"),
-                        "a1_count": stats.get("a1_count"),
-                        "best_obj1": stats.get("best_obj1"),
-                        "step_count": stats.get("step_count"),
-                        "epsilon": float(epsilon),
-                    }
+        for env in envs:
+            state = env.reset()
+            reward_sum = 0.0
+            transition_count = 0
+            for _ in range(rollout_steps):
+                action = env.select_action(local_policy, state, epsilon=float(epsilon))
+                next_state, reward, done, _ = env.step(action)
+                replay.add(
+                    [
+                        {
+                            "state": state,
+                            "action": int(action),
+                            "reward": float(reward),
+                            "next_state": next_state,
+                            "done": bool(done),
+                        }
+                    ]
                 )
-                if stats:
-                    print(
-                        f"{stats['problem_name']}-{stats['dim']}D interact #{global_interact_index} "
-                        f"epoch {epoch + 1} done, "
-                        f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
-                        f"eps={epsilon:.4f}, reward_sum={reward_sum:.6f}, "
-                        f"reward_mean={reward_sum / max(transition_count, 1):.6f}, "
-                        f"best_obj1={stats['best_obj1']:.6f}"
-                    )
+                reward_sum += float(reward)
+                transition_count += 1
+                total_transitions += 1
+                epoch_reward_sum += float(reward)
+                epoch_reward_count += 1
+                state = next_state
+                if done:
+                    break
 
-        mean_worker_reward = float(np.mean(worker_reward_sums)) if worker_reward_sums else 0.0
-        print(
-            f"Epoch {epoch + 1} rollout done | "
-            f"workers={len(worker_reward_sums)} | mean_worker_reward={mean_worker_reward:.6f}"
-        )
+            stats = env.episode_stats()
+            reward_records.append(
+                {
+                    "epoch": epoch + 1,
+                    "task_name": f"{stats['problem_name']}|{stats['dim']}",
+                    "problem": stats["problem_name"],
+                    "dim": stats["dim"],
+                    "transition_count": int(transition_count),
+                    "reward_sum": float(reward_sum),
+                    "reward_mean": float(reward_sum / max(transition_count, 1)),
+                    "true_evals": stats["true_evals"],
+                    "a1_count": stats["a1_count"],
+                    "best_obj1": stats["best_obj1"],
+                    "step_count": stats["step_count"],
+                    "epsilon": float(epsilon),
+                }
+            )
+            print(
+                f"{stats['problem_name']}-{stats['dim']}D epoch {epoch + 1} rollout done, "
+                f"true_evals={stats['true_evals']}, a1_count={stats['a1_count']}, "
+                f"eps={epsilon:.4f}, reward_sum={reward_sum:.6f}, "
+                f"reward_mean={reward_sum / max(transition_count, 1):.6f}, "
+                f"best_obj1={stats['best_obj1']:.6f}"
+            )
 
         updates_this_epoch = max(1, total_transitions // max(int(args.batch_size), 1))
         for _ in range(updates_this_epoch):
-            batch = ray.get(replay.sample.remote(args.batch_size))
+            batch = replay.sample(args.batch_size)
             loss_value = learner.update_model(batch=batch, gamma=args.gamma, grad_clip=args.grad_clip)
             if batch:
                 epoch_losses.append(float(loss_value))
@@ -694,12 +674,11 @@ def train_db_multisource(args):
         TRAIN_LOG_PATH,
         {
             "script": "db_zdt1_eva.py",
-            "mode": "train_db_multisource_distributed",
+            "mode": "train_db_multisource_local_dqn",
             "model_path": MODEL_PATH,
             "source_problems": SOURCE_PROBLEMS,
             "source_dims": SOURCE_DIMS,
             "task_names": task_names,
-            "num_workers": num_workers,
             "action_names": ACTION_NAMES,
             "epoch_mean_rewards": epoch_mean_rewards,
             "epoch_mean_losses": epoch_mean_losses,
