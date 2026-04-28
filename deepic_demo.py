@@ -221,12 +221,13 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             new_x=selected_x,
             new_y=selected_y,
         )
-        uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
-            uncertainty_x=uncertainty_x,
-            uncertainty_y=uncertainty_y,
-            new_x=selected_x,
-            new_y=selected_y,
-        )
+        if surrogate_mode != "gp":
+            uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                uncertainty_x=uncertainty_x,
+                uncertainty_y=uncertainty_y,
+                new_x=selected_x,
+                new_y=selected_y,
+            )
 
         fronts, _ = demo.fast_non_dominated_sort(archive_y)
         front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
