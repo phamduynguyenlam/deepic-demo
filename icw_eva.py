@@ -137,6 +137,342 @@ def _subsample_archive_for_model(
     return selected_x.astype(np.float32), selected_y.astype(np.float32)
 
 
+
+# -----------------------------
+# Centralized PPO training setup
+# -----------------------------
+ALL_BBO_PROBLEMS = [
+    "ZDT1", "ZDT2", "ZDT3",
+    "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTLZ6", "DTLZ7",
+]
+CENTRALIZED_TRAIN_DIMS = [15, 20]
+
+
+def _centralized_train_problems(target_problem: str) -> list[str]:
+    """Return the 8 training problems used when target_problem is held out."""
+    target_upper = str(target_problem).upper()
+    problems = [p for p in ALL_BBO_PROBLEMS if p.upper() != target_upper]
+    if len(problems) != len(ALL_BBO_PROBLEMS) - 1:
+        print(
+            f"Warning: target_problem={target_problem!r} is not in ALL_BBO_PROBLEMS; "
+            "using all benchmark problems for training."
+        )
+        problems = list(ALL_BBO_PROBLEMS)
+    return problems
+
+
+def _cpu_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in state_dict.items()}
+
+
+def _shape_group_key(sample: dict) -> tuple:
+    """Group samples that can be stacked into one PPO tensor batch."""
+    lower = np.asarray(sample["lower"], dtype=np.float32).reshape(-1)
+    upper = np.asarray(sample["upper"], dtype=np.float32).reshape(-1)
+    return (
+        tuple(np.asarray(sample["archive_x"]).shape),
+        tuple(np.asarray(sample["archive_y"]).shape),
+        tuple(np.asarray(sample["offspring_x"]).shape),
+        tuple(np.asarray(sample["offspring_pred"]).shape),
+        tuple(np.asarray(sample["offspring_sigma"]).shape),
+        tuple(np.asarray(sample["action"]).shape),
+        tuple(lower.tolist()),
+        tuple(upper.tolist()),
+    )
+
+
+def _split_trajectories_by_shape(trajectories: list[dict]) -> dict[tuple, list[dict]]:
+    groups: dict[tuple, list[dict]] = {}
+    for sample in trajectories:
+        groups.setdefault(_shape_group_key(sample), []).append(sample)
+    return groups
+
+
+def _merge_loss_stats_weighted(group_stats: list[dict[str, float]]) -> dict[str, float]:
+    if not group_stats:
+        return {
+            "total_loss": 0.0, "actor_loss": 0.0, "critic_loss": 0.0,
+            "entropy_loss": 0.0, "weight_kl": 0.0, "weight_entropy": 0.0,
+            "approx_kl": 0.0, "ratio_mean": 0.0, "ratio_std": 0.0,
+            "ratio_min": 0.0, "ratio_max": 0.0, "adv_mean": 0.0,
+            "adv_std": 0.0, "adv_min": 0.0, "adv_max": 0.0,
+            "logit_reg": 0.0, "updates": 0.0,
+        }
+    total_updates = sum(float(s.get("updates", 0.0)) for s in group_stats)
+    if total_updates <= 0:
+        total_updates = float(len(group_stats))
+        weights = [1.0 for _ in group_stats]
+    else:
+        weights = [float(s.get("updates", 0.0)) for s in group_stats]
+
+    keys = [
+        "total_loss", "actor_loss", "critic_loss", "entropy_loss", "weight_kl",
+        "weight_entropy", "approx_kl", "ratio_mean", "ratio_std", "ratio_min",
+        "ratio_max", "adv_mean", "adv_std", "adv_min", "adv_max", "logit_reg",
+    ]
+    merged = {k: 0.0 for k in keys}
+    for s, w in zip(group_stats, weights):
+        for k in keys:
+            merged[k] += float(s.get(k, 0.0)) * w
+    for k in keys:
+        merged[k] /= max(total_updates, 1e-12)
+    merged["updates"] = total_updates
+    return merged
+
+
+def _update_icw_from_centralized_ppo_groups(
+    model: ICW,
+    optimizer,
+    trajectories: list[dict],
+    device: str,
+    ppo_epochs: int,
+    minibatch_size: int,
+    clip_eps: float,
+    value_coef: float,
+    entropy_coef: float,
+    weight_kl_coef: float,
+    grad_clip: float | None,
+    target_kl: float | None,
+    adv_clip: float = 2.0,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Update PPO on all collected trajectories, split only when tensor shapes differ."""
+    grouped = _split_trajectories_by_shape(trajectories)
+    group_sizes = {str(k): len(v) for k, v in grouped.items()}
+    stats_per_group: list[dict[str, float]] = []
+    # Largest groups first usually gives the most stable update early.
+    for _, group_samples in sorted(grouped.items(), key=lambda kv: len(kv[1]), reverse=True):
+        stats = _update_icw_from_episode_ppo(
+            model=model,
+            optimizer=optimizer,
+            episode_trajectory=group_samples,
+            device=device,
+            ppo_epochs=ppo_epochs,
+            minibatch_size=minibatch_size,
+            clip_eps=clip_eps,
+            value_coef=value_coef,
+            entropy_coef=entropy_coef,
+            weight_kl_coef=weight_kl_coef,
+            grad_clip=grad_clip,
+            target_kl=target_kl,
+            adv_clip=adv_clip,
+        )
+        stats_per_group.append(stats)
+    return _merge_loss_stats_weighted(stats_per_group), group_sizes
+
+
+def _collect_one_icw_env_trajectory(
+    args,
+    model_state_dict: dict[str, torch.Tensor],
+    problem_name: str,
+    dim: int,
+    epoch: int,
+) -> tuple[list[dict], list[dict], dict]:
+    """Collect one on-policy trajectory for one (problem, dim) environment.
+
+    This function is intentionally self-contained so it can be called in a CPU
+    worker process. It returns raw numpy arrays only; PPO update happens in the
+    main process.
+    """
+    # Avoid CPU oversubscription when several worker processes are used.
+    torch.set_num_threads(1)
+
+    worker_args = args
+    worker_args.device = "cpu" if str(getattr(args, "device", "cpu")).startswith("cuda") else args.device
+
+    model = _build_icw(worker_args)
+    model.load_state_dict(model_state_dict)
+    model.eval()
+
+    entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, worker_args)
+    problem = entry["problem"]
+    kan_surrogates = entry["models"]
+
+    trajectory: list[dict] = []
+    reward_records: list[dict] = []
+    surrogate_mode = multisource._surrogate_model_name(worker_args)
+
+    archive_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=worker_args.archive_size,
+        dim=dim,
+        seed=worker_args.seed + epoch * 10000 + multisource._stable_seed(0, problem_name, dim),
+    )
+    archive_y = problem.evaluate(archive_x)
+
+    uncertainty_x = uncertainty_y = None
+    gp_surrogates = None
+    if surrogate_mode == "gp":
+        gp_surrogates = demo.fit_gp_surrogates(
+            archive_x=archive_x,
+            archive_y=archive_y,
+            seed=worker_args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim),
+        )
+    else:
+        uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+
+    true_evals = worker_args.archive_size
+    remaining_budget = worker_args.max_fe - true_evals
+    steps_to_run = remaining_budget // worker_args.k_eval
+
+    for step in range(steps_to_run):
+        archive_x_t = archive_x.copy()
+        archive_y_t = archive_y.copy()
+
+        if surrogate_mode == "gp":
+            if gp_surrogates is None:
+                raise ValueError("GP surrogate requested but gp_surrogates is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=archive_x_t,
+                problem=problem,
+                surrogates=gp_surrogates,
+                device=worker_args.device,
+                n_offspring=worker_args.offspring_size,
+                sigma=worker_args.mutation_sigma,
+                surrogate_nsga_steps=worker_args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_gp_mean,
+                generate_fn=demo.generate_offspring,
+            )
+            offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
+        else:
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=archive_x_t,
+                problem=problem,
+                surrogates=kan_surrogates,
+                device=worker_args.device,
+                n_offspring=worker_args.offspring_size,
+                sigma=worker_args.mutation_sigma,
+                surrogate_nsga_steps=worker_args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_kan,
+                generate_fn=demo.generate_offspring,
+            )
+            archive_pred = demo.predict_with_kan(kan_surrogates, uncertainty_x, worker_args.device).astype(np.float32)
+            offspring_sigma = demo.estimate_uncertainty(
+                archive_x=uncertainty_x,
+                archive_y=uncertainty_y,
+                archive_pred=archive_pred,
+                offspring_x=offspring_x,
+            ).astype(np.float32)
+
+        progress = float(true_evals / worker_args.max_fe)
+        model_archive_x_t, model_archive_y_t = _subsample_archive_for_model(
+            archive_x=archive_x_t,
+            archive_y=archive_y_t,
+            n_keep=int(worker_args.archive_size),
+        )
+
+        with torch.no_grad():
+            act_out = model.act(
+                x_true=torch.as_tensor(model_archive_x_t, dtype=torch.float32, device=worker_args.device),
+                y_true=torch.as_tensor(model_archive_y_t, dtype=torch.float32, device=worker_args.device),
+                x_sur=torch.as_tensor(offspring_x, dtype=torch.float32, device=worker_args.device),
+                y_sur=torch.as_tensor(offspring_pred, dtype=torch.float32, device=worker_args.device),
+                sigma_sur=torch.as_tensor(offspring_sigma, dtype=torch.float32, device=worker_args.device),
+                progress=progress,
+                lower_bound=problem.lower,
+                upper_bound=problem.upper,
+                deterministic=False,
+            )
+
+        current_value = float(act_out["value"][0].detach().cpu())
+        if trajectory:
+            trajectory[-1]["next_value"] = current_value
+            trajectory[-1]["done"] = 0.0
+
+        selected_idx, _, _ = select_indices_from_action(  # type: ignore
+            action=act_out["action_weights"][0].detach().cpu(),
+            archive_y=archive_y_t,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            k_eval=worker_args.k_eval,
+            seed=_criterion_seed(worker_args.seed, epoch, step, problem_name, dim),
+            epdi_mc_samples=EPDI_MC_SAMPLES,
+        )
+        selected_x = offspring_x[selected_idx]
+        selected_y = problem.evaluate(selected_x)
+
+        reward_value = float(
+            multisource._compute_reward(
+                previous_front=archive_y_t,
+                selected_objectives=selected_y,
+                reward_scheme=int(getattr(worker_args, "reward_scheme", 1)),
+                problem_name=problem_name,
+                dim=dim,
+            )
+        )
+        reward_records.append(
+            {
+                "epoch": epoch + 1,
+                "problem": problem_name,
+                "dim": int(dim),
+                "step": step + 1,
+                "progress": float(progress),
+                "reward": reward_value,
+                "train_algo": "centralized_ppo",
+            }
+        )
+
+        trajectory.append(
+            {
+                "problem": problem_name,
+                "dim": int(dim),
+                "archive_x": model_archive_x_t.astype(np.float32, copy=False),
+                "archive_y": model_archive_y_t.astype(np.float32, copy=False),
+                "offspring_x": offspring_x.astype(np.float32, copy=False),
+                "offspring_pred": offspring_pred.astype(np.float32, copy=False),
+                "offspring_sigma": offspring_sigma.astype(np.float32, copy=False),
+                "progress": float(progress),
+                "lower": np.asarray(problem.lower, dtype=np.float32),
+                "upper": np.asarray(problem.upper, dtype=np.float32),
+                "action": act_out["action"][0].detach().cpu().numpy().astype(np.float32, copy=False),
+                "action_weights": act_out["action_weights"][0].detach().cpu().numpy().astype(np.float32, copy=False),
+                "old_logprob": float(act_out["logprob"][0].detach().cpu()),
+                "value": current_value,
+                "next_value": 0.0,
+                "done": 1.0,
+                "reward": reward_value,
+            }
+        )
+
+        archive_x, archive_y = demo.update_archive(
+            archive_x=archive_x_t,
+            archive_y=archive_y_t,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        if surrogate_mode == "gp":
+            gp_surrogates = demo.fit_gp_surrogates(
+                archive_x=archive_x,
+                archive_y=archive_y,
+                seed=worker_args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim) + step + 1,
+            )
+        else:
+            uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                uncertainty_x=uncertainty_x,
+                uncertainty_y=uncertainty_y,
+                new_x=selected_x,
+                new_y=selected_y,
+            )
+
+        true_evals += selected_x.shape[0]
+        if true_evals >= worker_args.max_fe:
+            break
+
+    multisource._attach_ppo_targets(
+        trajectory,
+        discount=float(worker_args.discount),
+        gae_lambda=float(getattr(worker_args, "ppo_gae_lambda", 0.95)),
+    )
+    summary = {
+        "problem": problem_name,
+        "dim": int(dim),
+        "true_evals": int(true_evals),
+        "best_obj1": float(np.min(archive_y[:, 0])),
+        "steps": int(len(trajectory)),
+        "mean_reward": float(np.mean([s["reward"] for s in trajectory])) if trajectory else 0.0,
+    }
+    return trajectory, reward_records, summary
+
 def _icw_ppo_loss(
     agent: ICW,
     batch: dict[str, torch.Tensor],
@@ -414,7 +750,15 @@ def _update_icw_from_episode_ppo(
     return stats
 
 
+
 def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool = False) -> ICW:
+    """Centralized PPO for ICW.
+
+    Hold out target_problem. Train on the remaining 8 benchmark problems and
+    two dimensions [15, 20], i.e. 16 environments per epoch. Rollouts are
+    collected with the same frozen policy, then grouped by tensor shape for PPO
+    updates. This keeps PPO on-policy while avoiding single-sample groups.
+    """
     demo.set_seed(args.seed)
     reward_records: list[dict] = []
     epoch_mean_rewards: list[float] = []
@@ -424,33 +768,50 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     best_reward_model_path = _best_reward_model_path(target_problem, self_train_only=self_train_only)
     best_epoch_mean_reward = float("-inf")
 
+    # Kaggle free CPU: avoid oversubscription. Increase explicitly if needed.
+    torch.set_num_threads(int(getattr(args, "torch_num_threads", 2)))
+
     model = _build_icw(args)
 
-    ppo_actor_lr = 5e-5
-    ppo_critic_lr = 1e-4
-    ppo_epochs = 3
-    ppo_minibatch_size = 16
+    ppo_actor_lr = 1e-4
+    ppo_critic_lr = 5e-5
+    ppo_epochs = 4
+    ppo_minibatch_size = int(getattr(args, "ppo_minibatch_size", 32))
     ppo_clip_eps = 0.05
-    ppo_value_coef = 0.03
-    ppo_entropy_coef = 0.02
+    ppo_value_coef = 0.05
+    ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
     ppo_weight_kl_coef = float(getattr(args, "icw_weight_kl_coef", 0.01))
     ppo_gae_lambda = float(getattr(args, "ppo_gae_lambda", 0.95))
     ppo_grad_clip = float(getattr(args, "ppo_grad_clip", 1.0))
     ppo_target_kl = 0.005
-    ppo_adv_clip = 1.5
+    ppo_adv_clip = float(getattr(args, "ppo_adv_clip", 2.0))
+
+    train_problems = _centralized_train_problems(target_problem)
+    train_dims = list(getattr(args, "centralized_train_dims", CENTRALIZED_TRAIN_DIMS))
+    train_envs = [(p, int(d)) for p in train_problems for d in train_dims]
+    parallel_workers = int(getattr(args, "ppo_parallel_workers", 1))
+    # On Kaggle CPU, 1-2 workers are usually safer than many workers because GP/KAN
+    # and NSGA inner loops can oversubscribe BLAS/OpenMP threads.
+    parallel_workers = max(1, min(parallel_workers, len(train_envs)))
 
     print(
-        f"Training config (PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | discount={args.discount:.4f} | "
-        f"ppo_epochs={ppo_epochs} | ppo_clip_eps={ppo_clip_eps:.3f} | "
-        f"actor_lr={ppo_actor_lr:.1e} | critic_lr={ppo_critic_lr:.1e} | "
-        f"vf_coef={ppo_value_coef:.3f} | target_kl={ppo_target_kl:.4f} | "
-        f"weight_kl_coef={ppo_weight_kl_coef:.4f} | adv_clip={ppo_adv_clip:.2f} | "
-        f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
-        f"surrogate_model={multisource._surrogate_model_name(args)} | "
-        f"rollout_problems={int(getattr(args, 'ppo_rollout_problems', 3))}"
+        f"Training config (Centralized PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | "
+        f"discount={args.discount:.4f} | ppo_epochs={ppo_epochs} | ppo_clip_eps={ppo_clip_eps:.3f} | "
+        f"actor_lr={ppo_actor_lr:.1e} | critic_lr={ppo_critic_lr:.1e} | vf_coef={ppo_value_coef:.3f} | "
+        f"target_kl={ppo_target_kl:.4f} | weight_kl_coef={ppo_weight_kl_coef:.4f} | "
+        f"adv_clip={ppo_adv_clip:.2f} | reward_scheme={getattr(args, 'reward_scheme', 1)} | "
+        f"surrogate_model={multisource._surrogate_model_name(args)} | heldout={target_problem} | "
+        f"train_envs={len(train_envs)} ({len(train_problems)} problems × {len(train_dims)} dims) | "
+        f"parallel_workers={parallel_workers}"
     )
+    print(f"Training problems: {train_problems}")
+    print(f"Training dims: {train_dims}")
 
-    pretrain_cache = _pretrain_target_surrogates(args, target_problem)
+    # Warm up / prepare surrogate cache once in the main process. This avoids
+    # multiple workers trying to create the same cached file at the same time.
+    for p, d in train_envs:
+        multisource.load_or_prepare_kan_surrogate(p, d, args)
+
     optimizer = multisource._build_ppo_optimizer(
         model=model,
         actor_lr=ppo_actor_lr,
@@ -466,243 +827,74 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
 
     for epoch in range(args.start_epoch, multisource.TRAIN_EPOCHS):
         print(f"Epoch {epoch + 1}/{multisource.TRAIN_EPOCHS}")
-        epoch_rewards: list[float] = []
-        epoch_total_losses: list[float] = []
+        epoch_trajectories: list[dict] = []
+        epoch_reward_records: list[dict] = []
+        env_summaries: list[dict] = []
 
-        dim_rollout_buffers: dict[int, dict[str, object]] = {}
-        for dim in multisource.SOURCE_DIMS:
-            dim_trajectories: list[dict] = []
-            dim_problem_count = 0
+        # Freeze the rollout policy for this epoch. All envs collect on-policy
+        # data from the same parameters before any PPO update happens.
+        rollout_state = _cpu_state_dict(model.state_dict())
 
-            if self_train_only:
-                rollout_problems = [target_problem]
-            else:
-                rollout_problems = multisource._select_rollout_problems(
-                    target_problem=target_problem,
-                    self_train_only=self_train_only,
-                    n_rollouts=int(getattr(args, "ppo_rollout_problems", 3)),
-                    seed=args.seed + epoch * 10000 + multisource._stable_seed(113, target_problem, dim),
+        if parallel_workers == 1:
+            for problem_name, dim in train_envs:
+                traj, records, summary = _collect_one_icw_env_trajectory(
+                    args=args,
+                    model_state_dict=rollout_state,
+                    problem_name=problem_name,
+                    dim=int(dim),
+                    epoch=epoch,
                 )
-
-            for problem_name in rollout_problems:
-                entry = pretrain_cache.get((problem_name, dim))
-                if entry is None:
-                    entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, args)
-                    pretrain_cache[(problem_name, dim)] = entry
-                problem = entry["problem"]
-                surrogates = entry["models"]
-                episode_trajectory: list[dict] = []
-
-                archive_x = multisource.latin_hypercube_sample(
-                    lower=problem.lower,
-                    upper=problem.upper,
-                    n_samples=args.archive_size,
-                    dim=dim,
-                    seed=args.seed + epoch * 10000 + multisource._stable_seed(0, problem_name, dim),
-                )
-                archive_y = problem.evaluate(archive_x)
-                surrogate_mode = multisource._surrogate_model_name(args)
-                uncertainty_x = uncertainty_y = None
-                gp_surrogates = None
-                if surrogate_mode == "gp":
-                    gp_surrogates = demo.fit_gp_surrogates(
-                        archive_x=archive_x,
-                        archive_y=archive_y,
-                        seed=args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim),
-                    )
-                else:
-                    uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
-
-                true_evals = args.archive_size
-                remaining_budget = args.max_fe - true_evals
-                steps_to_run = remaining_budget // args.k_eval
-
-                for step in range(steps_to_run):
-                    archive_x_t = archive_x.copy()
-                    archive_y_t = archive_y.copy()
-
-                    if surrogate_mode == "gp":
-                        if gp_surrogates is None:
-                            raise ValueError("GP surrogate requested but gp_surrogates is None.")
-                        offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
-                            archive_x=archive_x_t,
-                            problem=problem,
-                            surrogates=gp_surrogates,
-                            device=args.device,
-                            n_offspring=args.offspring_size,
-                            sigma=args.mutation_sigma,
-                            surrogate_nsga_steps=args.surrogate_nsga_steps,
-                            predict_fn=demo.predict_with_gp_mean,
-                            generate_fn=demo.generate_offspring,
-                        )
-                        offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
-                    else:
-                        offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
-                            archive_x=archive_x_t,
-                            problem=problem,
-                            surrogates=surrogates,
-                            device=args.device,
-                            n_offspring=args.offspring_size,
-                            sigma=args.mutation_sigma,
-                            surrogate_nsga_steps=args.surrogate_nsga_steps,
-                            predict_fn=demo.predict_with_kan,
-                            generate_fn=demo.generate_offspring,
-                        )
-                        archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
-                        offspring_sigma = demo.estimate_uncertainty(
-                            archive_x=uncertainty_x,
-                            archive_y=uncertainty_y,
-                            archive_pred=archive_pred,
-                            offspring_x=offspring_x,
-                        ).astype(np.float32)
-
-                    progress = float(true_evals / args.max_fe)
-                    model_archive_x_t, model_archive_y_t = _subsample_archive_for_model(
-                        archive_x=archive_x_t,
-                        archive_y=archive_y_t,
-                        n_keep=int(args.archive_size),
-                    )
-                    model.eval()
-                    with torch.no_grad():
-                        act_out = model.act(
-                            x_true=torch.as_tensor(model_archive_x_t, dtype=torch.float32, device=args.device),
-                            y_true=torch.as_tensor(model_archive_y_t, dtype=torch.float32, device=args.device),
-                            x_sur=torch.as_tensor(offspring_x, dtype=torch.float32, device=args.device),
-                            y_sur=torch.as_tensor(offspring_pred, dtype=torch.float32, device=args.device),
-                            sigma_sur=torch.as_tensor(offspring_sigma, dtype=torch.float32, device=args.device),
-                            progress=progress,
-                            lower_bound=problem.lower,
-                            upper_bound=problem.upper,
-                            deterministic=False,
-                        )
-
-                    current_value = float(act_out["value"][0].detach().cpu())
-                    if episode_trajectory:
-                        episode_trajectory[-1]["next_value"] = current_value
-                        episode_trajectory[-1]["done"] = 0.0
-
-                    selected_idx, _, _ = select_indices_from_action(  # type: ignore
-                        action=act_out["action_weights"][0],
-                        archive_y=archive_y_t,
-                        offspring_pred=offspring_pred,
-                        offspring_sigma=offspring_sigma,
-                        k_eval=args.k_eval,
-                        seed=_criterion_seed(args.seed, epoch, step, problem_name, dim),
-                        epdi_mc_samples=EPDI_MC_SAMPLES,
-                    )
-                    selected_x = offspring_x[selected_idx]
-                    selected_y = problem.evaluate(selected_x)
-
-                    reward_value = float(
-                        multisource._compute_reward(
-                            previous_front=archive_y_t,
-                            selected_objectives=selected_y,
-                            reward_scheme=int(getattr(args, "reward_scheme", 1)),
-                            problem_name=problem_name,
-                            dim=dim,
-                        )
-                    )
-                    epoch_rewards.append(reward_value)
-                    reward_records.append(
-                        {
-                            "epoch": epoch + 1,
-                            "problem": problem_name,
-                            "dim": int(dim),
-                            "step": step + 1,
-                            "progress": float(progress),
-                            "reward": reward_value,
-                            "train_algo": "ppo",
-                        }
-                    )
-
-                    episode_trajectory.append(
-                        {
-                            "archive_x": model_archive_x_t,
-                            "archive_y": model_archive_y_t,
-                            "offspring_x": offspring_x,
-                            "offspring_pred": offspring_pred,
-                            "offspring_sigma": offspring_sigma,
-                            "progress": float(progress),
-                            "lower": problem.lower,
-                            "upper": problem.upper,
-                            "action": act_out["action"][0].detach().cpu().numpy().astype(np.float32, copy=False),
-                            "action_weights": act_out["action_weights"][0]
-                            .detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32, copy=False),
-                            "old_logprob": float(act_out["logprob"][0].detach().cpu()),
-                            "value": current_value,
-                            "next_value": 0.0,
-                            "done": 1.0,
-                            "reward": reward_value,
-                        }
-                    )
-
-                    archive_x, archive_y = demo.update_archive(
-                        archive_x=archive_x_t,
-                        archive_y=archive_y_t,
-                        new_x=selected_x,
-                        new_y=selected_y,
-                    )
-                    if surrogate_mode == "gp":
-                        gp_surrogates = demo.fit_gp_surrogates(
-                            archive_x=archive_x,
-                            archive_y=archive_y,
-                            seed=args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim) + step + 1,
-                        )
-                    else:
-                        uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
-                            uncertainty_x=uncertainty_x,
-                            uncertainty_y=uncertainty_y,
-                            new_x=selected_x,
-                            new_y=selected_y,
-                        )
-
-                    true_evals += selected_x.shape[0]
-                    if true_evals >= args.max_fe:
-                        break
-
-                multisource._attach_ppo_targets(
-                    episode_trajectory,
-                    discount=float(args.discount),
-                    gae_lambda=ppo_gae_lambda,
-                )
-                dim_trajectories.extend(episode_trajectory)
-                dim_problem_count += 1
-
+                epoch_trajectories.extend(traj)
+                epoch_reward_records.extend(records)
+                env_summaries.append(summary)
                 print(
                     f"{problem_name}-{dim}D epoch {epoch + 1} done, "
-                    f"true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0]):.6f}"
+                    f"true_evals={summary['true_evals']}, best_obj1={summary['best_obj1']:.6f}, "
+                    f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}"
                 )
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            import copy
 
-            dim_rollout_buffers[int(dim)] = {
-                "trajectories": dim_trajectories,
-                "problem_count": dim_problem_count,
-            }
+            # Use CPU in workers. The main process can still update on args.device.
+            worker_args = copy.copy(args)
+            worker_args.device = "cpu"
+            with ProcessPoolExecutor(max_workers=parallel_workers) as ex:
+                futures = [
+                    ex.submit(
+                        _collect_one_icw_env_trajectory,
+                        worker_args,
+                        rollout_state,
+                        problem_name,
+                        int(dim),
+                        epoch,
+                    )
+                    for problem_name, dim in train_envs
+                ]
+                for fut in as_completed(futures):
+                    traj, records, summary = fut.result()
+                    epoch_trajectories.extend(traj)
+                    epoch_reward_records.extend(records)
+                    env_summaries.append(summary)
+                    print(
+                        f"{summary['problem']}-{summary['dim']}D epoch {epoch + 1} done, "
+                        f"true_evals={summary['true_evals']}, best_obj1={summary['best_obj1']:.6f}, "
+                        f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}"
+                    )
 
-        for dim in multisource.SOURCE_DIMS:
-            buffer = dim_rollout_buffers.get(int(dim), {})
-            dim_trajectories = list(buffer.get("trajectories", []))  # type: ignore[arg-type]
-            dim_problem_count = int(buffer.get("problem_count", 0))
-            if not dim_trajectories:
-                continue
+        reward_records.extend(epoch_reward_records)
+        epoch_rewards = [float(r["reward"]) for r in epoch_reward_records]
 
-            action_matrix = np.stack([np.asarray(sample["action"], dtype=np.float32) for sample in dim_trajectories], axis=0)
-            action_mean = action_matrix.mean(axis=0)
-            action_std = action_matrix.std(axis=0)
+        if epoch_trajectories:
+            action_matrix = np.stack([np.asarray(s["action"], dtype=np.float32) for s in epoch_trajectories], axis=0)
+            weight_matrix = np.stack([np.asarray(s["action_weights"], dtype=np.float32) for s in epoch_trajectories], axis=0)
+            action_mean, action_std = action_matrix.mean(axis=0), action_matrix.std(axis=0)
+            weight_mean, weight_std = weight_matrix.mean(axis=0), weight_matrix.std(axis=0)
 
-            weight_matrix = np.stack(
-                [np.asarray(sample["action_weights"], dtype=np.float32) for sample in dim_trajectories],
-                axis=0,
-            )
-            weight_mean = weight_matrix.mean(axis=0)
-            weight_std = weight_matrix.std(axis=0)
-
-            loss_stats = _update_icw_from_episode_ppo(
+            loss_stats, group_sizes = _update_icw_from_centralized_ppo_groups(
                 model=model,
                 optimizer=optimizer,
-                episode_trajectory=dim_trajectories,
+                trajectories=epoch_trajectories,
                 device=args.device,
                 ppo_epochs=ppo_epochs,
                 minibatch_size=ppo_minibatch_size,
@@ -714,26 +906,29 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                 target_kl=ppo_target_kl,
                 adv_clip=ppo_adv_clip,
             )
-            epoch_total_losses.append(loss_stats["total_loss"])
+            epoch_mean_total_losses.append(loss_stats["total_loss"])
+
+            compact_groups = sorted(group_sizes.values(), reverse=True)
             print(
-                f"Updated ICW PPO for {dim}D with {dim_problem_count} problems "
-                f"({len(dim_trajectories)} rollout steps), total_loss={loss_stats['total_loss']:.6f}, "
-                f"actor={loss_stats['actor_loss']:.6f}, critic={loss_stats['critic_loss']:.6f}, "
-                f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}, "
-                f"weight_kl={loss_stats.get('weight_kl', 0.0):.6f}, weight_ent={loss_stats.get('weight_entropy', 0.0):.6f}, "
-                f"ratio_mean={loss_stats['ratio_mean']:.6f}, ratio_std={loss_stats['ratio_std']:.6f}, "
-                f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
-                f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
-                f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f}, "
-                f"logit_reg={loss_stats.get('logit_reg', 0.0):.6f}, "
+                f"Centralized PPO update | envs={len(train_envs)} | rollout_steps={len(epoch_trajectories)} | "
+                f"shape_groups={len(group_sizes)} | group_sizes={compact_groups} | "
+                f"total_loss={loss_stats['total_loss']:.6f}, actor={loss_stats['actor_loss']:.6f}, "
+                f"critic={loss_stats['critic_loss']:.6f}, entropy={loss_stats['entropy_loss']:.6f}, "
+                f"approx_kl={loss_stats['approx_kl']:.6f}, weight_kl={loss_stats.get('weight_kl', 0.0):.6f}, "
+                f"weight_ent={loss_stats.get('weight_entropy', 0.0):.6f}, ratio_mean={loss_stats['ratio_mean']:.6f}, "
+                f"ratio_std={loss_stats['ratio_std']:.6f}, ratio_min={loss_stats['ratio_min']:.6f}, "
+                f"ratio_max={loss_stats['ratio_max']:.6f}, adv_mean={loss_stats['adv_mean']:.6f}, "
+                f"adv_std={loss_stats['adv_std']:.6f}, adv_min={loss_stats['adv_min']:.6f}, "
+                f"adv_max={loss_stats['adv_max']:.6f}, logit_reg={loss_stats.get('logit_reg', 0.0):.6f}, "
                 f"action_mean={_format_vector(action_mean)}, action_std={_format_vector(action_std)} | "
                 f"weight_mean={_format_vector(weight_mean)}, weight_std={_format_vector(weight_std)}"
             )
+        else:
+            epoch_mean_total_losses.append(0.0)
 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
-        epoch_mean_loss = float(np.mean(epoch_total_losses)) if epoch_total_losses else 0.0
+        epoch_mean_loss = float(epoch_mean_total_losses[-1]) if epoch_mean_total_losses else 0.0
         epoch_mean_rewards.append(epoch_mean)
-        epoch_mean_total_losses.append(epoch_mean_loss)
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         print(f"Epoch {epoch + 1} mean PPO total loss: {epoch_mean_loss:.6f}")
 
@@ -752,7 +947,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
         if (epoch + 1) % 5 == 0:
             multisource.save_colab_model_checkpoint(
                 model.state_dict(),
-                f"iwc_{_problem_slug(target_problem)}_{'self_only' if self_train_only else 'source_mix'}_ppo_epoch_{epoch + 1}.pth",
+                f"iwc_{_problem_slug(target_problem)}_{'self_only' if self_train_only else 'source_mix'}_centralized_ppo_epoch_{epoch + 1}.pth",
             )
 
     torch.save(model.state_dict(), model_path)
@@ -760,13 +955,13 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     multisource._save_reward_log(
         reward_log_path,
         {
-            "script": "icw_demo.py",
-            "mode": "train_icw_multisource_ppo",
-            "target_problem": target_problem,
+            "script": "icw_demo_centralized_ppo.py",
+            "mode": "train_icw_multisource_ppo_centralized",
+            "heldout_target_problem": target_problem,
             "model_path": str(model_path),
-            "training_problems": [target_problem],
-            "source_dims": multisource.SOURCE_DIMS,
-            "training_label": "iwc_self_only" if self_train_only else "iwc_source_mix",
+            "training_problems": train_problems,
+            "train_dims": train_dims,
+            "training_label": "iwc_centralized_ppo_holdout",
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": multisource._surrogate_model_name(args),
             "best_reward_model_path": str(best_reward_model_path),
@@ -793,7 +988,6 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     )
     print(f"Reward log saved to {reward_log_path}")
     return model
-
 
 def load_or_train_icw(args, target_problem: str, self_train_only: bool = False) -> ICW:
     model_path = _final_model_path(target_problem, self_train_only=self_train_only)
