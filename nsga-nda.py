@@ -276,6 +276,109 @@ def fast_non_dominated_sort(values: np.ndarray) -> tuple[list[list[int]], np.nda
     return fronts, ranks
 
 
+def _crowding_distance(values: np.ndarray, front: list[int]) -> np.ndarray:
+    if not front:
+        return np.array([], dtype=np.float32)
+
+    distance = np.zeros(len(front), dtype=np.float32)
+    front_values = values[np.asarray(front, dtype=np.int64)]
+    n_obj = values.shape[1]
+
+    for obj_id in range(n_obj):
+        order = np.argsort(front_values[:, obj_id])
+        distance[order[0]] = np.inf
+        distance[order[-1]] = np.inf
+        obj_min = front_values[order[0], obj_id]
+        obj_max = front_values[order[-1], obj_id]
+        denom = max(obj_max - obj_min, 1e-12)
+
+        for idx in range(1, len(front) - 1):
+            prev_val = front_values[order[idx - 1], obj_id]
+            next_val = front_values[order[idx + 1], obj_id]
+            distance[order[idx]] += (next_val - prev_val) / denom
+
+    return distance
+
+
+def _nsga2_survival(x: np.ndarray, y: np.ndarray, n_keep: int) -> tuple[np.ndarray, np.ndarray]:
+    fronts, _ = fast_non_dominated_sort(y)
+    keep_indices: list[int] = []
+
+    for front in fronts:
+        if not front:
+            continue
+        if len(keep_indices) + len(front) <= n_keep:
+            keep_indices.extend(front)
+            continue
+
+        crowding = _crowding_distance(y, front)
+        order = np.argsort(-crowding)
+        remaining = n_keep - len(keep_indices)
+        keep_indices.extend(np.asarray(front, dtype=np.int64)[order[:remaining]].tolist())
+        break
+
+    keep_indices = np.asarray(keep_indices, dtype=np.int64)
+    return x[keep_indices], y[keep_indices]
+
+
+def _nsga2_sort_key(values: np.ndarray) -> np.ndarray:
+    fronts, ranks = fast_non_dominated_sort(values)
+    crowding = np.zeros(values.shape[0], dtype=np.float32)
+
+    for front in fronts:
+        if front:
+            crowding[np.asarray(front, dtype=np.int64)] = _crowding_distance(values, front)
+
+    return np.lexsort((values.sum(axis=1), -crowding, ranks)).astype(np.int64)
+
+
+def generate_nsga2_pseudo_front(
+    archive_x: np.ndarray,
+    problem,
+    surrogates,
+    device: str,
+    n_offspring: int,
+    sigma: float,
+    surrogate_nsga_steps: int,
+    predict_fn,
+    generate_fn,
+) -> tuple[np.ndarray, np.ndarray]:
+    population_x = generate_fn(
+        archive_x=archive_x,
+        n_offspring=n_offspring,
+        lower=problem.lower,
+        upper=problem.upper,
+        sigma=sigma,
+    ).astype(np.float32)
+    population_y = predict_fn(surrogates, population_x, device).astype(np.float32)
+
+    for _ in range(surrogate_nsga_steps):
+        offspring_x = generate_fn(
+            archive_x=population_x,
+            n_offspring=n_offspring,
+            lower=problem.lower,
+            upper=problem.upper,
+            sigma=sigma,
+        ).astype(np.float32)
+        offspring_y = predict_fn(surrogates, offspring_x, device).astype(np.float32)
+
+        union_x = np.vstack([population_x, offspring_x])
+        union_y = np.vstack([population_y, offspring_y])
+        population_x, population_y = _nsga2_survival(union_x, union_y, n_keep=n_offspring)
+
+    fronts, _ = fast_non_dominated_sort(population_y)
+    pseudo_front_idx = np.asarray(fronts[0], dtype=np.int64)
+    pseudo_front_x = population_x[pseudo_front_idx]
+    pseudo_front_y = population_y[pseudo_front_idx]
+
+    if pseudo_front_x.shape[0] < n_offspring:
+        order = _nsga2_sort_key(population_y)
+        pseudo_front_x = population_x[order]
+        pseudo_front_y = population_y[order]
+
+    return pseudo_front_x.astype(np.float32), pseudo_front_y.astype(np.float32)
+
+
 def update_archive(
     archive_x: np.ndarray,
     archive_y: np.ndarray,
@@ -423,10 +526,10 @@ def select_nda(offspring_pred: np.ndarray, offspring_sigma: np.ndarray, k: int) 
 def parse_args():
     parser = argparse.ArgumentParser(description="ZDT1 optimization with KAN surrogate + ND-A infill")
     parser.add_argument("--dim", type=int, default=30)
-    parser.add_argument("--archive_size", type=int, default=100)
+    parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
     parser.add_argument("--k_eval", type=int, default=5)
-    parser.add_argument("--max_fe", type=int, default=200)
+    parser.add_argument("--max_fe", type=int, default=120)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
     parser.add_argument("--kan_hidden", type=int, default=10)
@@ -436,6 +539,7 @@ def parse_args():
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
+    parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
@@ -493,14 +597,17 @@ def run_nsga_nda(args, plot: bool = True, initial_archive_x: np.ndarray | None =
     )
 
     for step in range(steps_to_run):
-        offspring_x = generate_offspring(
+        offspring_x, offspring_pred = generate_nsga2_pseudo_front(
             archive_x=archive_x,
+            problem=problem,
+            surrogates=surrogates,
+            device=args.device,
             n_offspring=args.offspring_size,
-            lower=problem.lower,
-            upper=problem.upper,
             sigma=args.mutation_sigma,
+            surrogate_nsga_steps=args.surrogate_nsga_steps,
+            predict_fn=predict_with_kan,
+            generate_fn=generate_offspring,
         )
-        offspring_pred = predict_with_kan(surrogates, offspring_x, args.device)
         archive_pred = predict_with_kan(surrogates, archive_x, args.device)
         offspring_sigma = estimate_uncertainty(
             archive_x=archive_x,

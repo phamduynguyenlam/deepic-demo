@@ -69,6 +69,25 @@ def save_colab_model_checkpoint(state_dict, filename: str) -> Path | None:
         return None
 
 
+def _candidate_model_paths(path: Path) -> list[Path]:
+    """Return possible locations for a checkpoint name across local/Colab/Kaggle dirs."""
+    candidates: list[Path] = [path]
+    for store_dir in (LOCAL_MODEL_DIR, KAGGLE_MODEL_DIR, COLAB_MODEL_DIR):
+        try:
+            candidates.append(store_dir / path.name)
+        except Exception:
+            continue
+    unique: list[Path] = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
 def _torch_load(path: Path | str, map_location: str):
     try:
         return demo.torch.load(path, map_location=map_location, weights_only=False)
@@ -261,12 +280,28 @@ def _compute_reward(
     hv_epsilon: float = 1e-8,
 ) -> float:
     if int(reward_scheme) == 1:
-        return float(
-            demo.DeepICClass.fpareto_improvement_reward(
-                previous_front=previous_front,
-                selected_objectives=selected_objectives,
-            )
-        )
+        previous_front = demo.DeepICClass.pareto_front(np.asarray(previous_front, dtype=np.float32))
+        selected_objectives = np.asarray(selected_objectives, dtype=np.float32)
+
+        improved = False
+        for candidate in selected_objectives:
+            if not any(demo.DeepICClass._dominates(prev, candidate) for prev in previous_front):
+                improved = True
+                break
+
+        if not improved:
+            return 0.0
+
+        reward = 0.0
+        origin = np.zeros(previous_front.shape[1], dtype=np.float32)
+        for candidate in selected_objectives:
+            distances = np.abs(previous_front - candidate).sum(axis=1)
+            nearest_idx = int(np.argmin(distances))
+            d_i = float(distances[nearest_idx])
+            d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
+            reward += d_i / max(d_ref_i, 1e-12)
+
+        return float(1.0 + 5.0 * reward)
 
     if int(reward_scheme) == 2:
         previous_front = demo.DeepICClass.pareto_front(np.asarray(previous_front, dtype=np.float32))
@@ -744,6 +779,7 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
         self_train_only=self_train_only,
     )
     best_epoch_mean_reward = float("-inf")
+    best_saved_path: Path | None = None
 
     deepic = demo.DeepICClass(
         hidden_dim=args.deepic_hidden,
@@ -918,10 +954,10 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
         print(f"Epoch {epoch + 1} mean reward: {epoch_mean:.6f}")
         if epoch_mean > best_epoch_mean_reward:
             best_epoch_mean_reward = epoch_mean
-            demo.torch.save(deepic.state_dict(), best_reward_model_path)
+            best_saved_path = save_colab_model_checkpoint(deepic.state_dict(), best_reward_model_path.name)
             print(
                 f"New best mean reward at epoch {epoch + 1}: {epoch_mean:.6f} | "
-                f"saved to {best_reward_model_path.name}"
+                f"saved to {(best_saved_path or best_reward_model_path).name}"
             )
         demo.torch.save(
             deepic.state_dict(),
@@ -947,7 +983,7 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
             "training_label": _training_label(self_train_only),
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": _surrogate_model_name(args),
-            "best_reward_model_path": str(best_reward_model_path),
+            "best_reward_model_path": str(best_saved_path or best_reward_model_path),
             "best_epoch_mean_reward": best_epoch_mean_reward,
             "epoch_mean_rewards": epoch_mean_rewards,
             "records": reward_records,
@@ -983,6 +1019,7 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         self_train_only=self_train_only,
     )
     best_epoch_mean_reward = float("-inf")
+    best_saved_path: Path | None = None
 
     deepic = demo.DeepICClass(
         hidden_dim=args.deepic_hidden,
@@ -1225,10 +1262,10 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         print(f"Epoch {epoch + 1} mean PPO total loss: {epoch_mean_loss:.6f}")
         if epoch_mean > best_epoch_mean_reward:
             best_epoch_mean_reward = epoch_mean
-            demo.torch.save(deepic.state_dict(), best_reward_model_path)
+            best_saved_path = save_colab_model_checkpoint(deepic.state_dict(), best_reward_model_path.name)
             print(
                 f"New best mean reward at epoch {epoch + 1}: {epoch_mean:.6f} | "
-                f"saved to {best_reward_model_path.name}"
+                f"saved to {(best_saved_path or best_reward_model_path).name}"
             )
         demo.torch.save(
             deepic.state_dict(),
@@ -1254,7 +1291,7 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
             "training_label": _training_label(self_train_only),
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": _surrogate_model_name(args),
-            "best_reward_model_path": str(best_reward_model_path),
+            "best_reward_model_path": str(best_saved_path or best_reward_model_path),
             "best_epoch_mean_reward": best_epoch_mean_reward,
             "epoch_mean_rewards": epoch_mean_rewards,
             "epoch_mean_total_losses": epoch_mean_total_losses,
@@ -1548,7 +1585,7 @@ def parse_args(target_problem: str, argv=None):
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
     parser.add_argument("--k_eval", type=int, default=1)
-    parser.add_argument("--max_fe", type=int, default=160)
+    parser.add_argument("--max_fe", type=int, default=120)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
     parser.add_argument("--kan_hidden", type=int, default=10)
@@ -1558,7 +1595,7 @@ def parse_args(target_problem: str, argv=None):
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
+    parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
     parser.add_argument("--discount", type=float, default=1.0, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--train_algo", type=str, default="reinforce", choices=["reinforce", "ppo"])
     parser.add_argument("--ppo_epochs", type=int, default=8)

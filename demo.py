@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -1487,7 +1488,7 @@ def parse_args():
     parser.add_argument("--n_obj", type=int, default=2)
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
-    parser.add_argument("--k_eval", type=int, default=5)
+    parser.add_argument("--k_eval", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=16)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
@@ -1498,7 +1499,7 @@ def parse_args():
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--max_fe", type=int, default=160)
+    parser.add_argument("--max_fe", type=int, default=120)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument(
         "--surrogate_model",
@@ -1675,4 +1676,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Optional shortcut: run the newer `deepic_demo.py` flow from this entrypoint.
+    # We remove the flag from sys.argv to avoid argparse conflicts.
+    if "--deepic-demo" in sys.argv:
+        sys.argv = [arg for arg in sys.argv if arg != "--deepic-demo"]
+        import deepic_demo
+
+        deepic_demo.main()
+    else:
+        main()
