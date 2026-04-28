@@ -191,6 +191,26 @@ def predict_with_gp(models: Sequence[GaussianProcessRegressor], x: np.ndarray) -
     return mean_array, std_array + 1e-6
 
 
+def predict_with_gp_mean(models: Sequence[GaussianProcessRegressor], x: np.ndarray, device: str | None = None) -> np.ndarray:
+    """Mean-only GP predictions (drop-in for `predict_with_kan` signature)."""
+    x_arr = np.asarray(x, dtype=np.float32)
+    mean_preds: list[np.ndarray] = []
+    for model in models:
+        mean = model.predict(x_arr)
+        mean_preds.append(np.asarray(mean, dtype=np.float32).reshape(-1))
+    return np.stack(mean_preds, axis=1).astype(np.float32)
+
+
+def predict_with_gp_std(models: Sequence[GaussianProcessRegressor], x: np.ndarray) -> np.ndarray:
+    """Std-only GP predictions (useful as DeepIC/ICW sigma input)."""
+    x_arr = np.asarray(x, dtype=np.float32)
+    std_preds: list[np.ndarray] = []
+    for model in models:
+        _, std = model.predict(x_arr, return_std=True)
+        std_preds.append(np.asarray(std, dtype=np.float32).reshape(-1))
+    return np.stack(std_preds, axis=1).astype(np.float32) + 1e-6
+
+
 def surrogate_model_name(args) -> str:
     return getattr(args, "surrogate_model", getattr(args, "uncertainty_model", "gp"))
 
@@ -203,7 +223,7 @@ def build_uncertainty_models(
 ) -> list[GaussianProcessRegressor] | None:
     if surrogate_model == "gp":
         return fit_gp_surrogates(archive_x=archive_x, archive_y=archive_y, seed=seed)
-    if surrogate_model == "knn":
+    if surrogate_model in {"knn", "kan"}:
         return None
     raise ValueError(f"Unsupported surrogate_model: {surrogate_model}")
 
@@ -223,7 +243,7 @@ def predict_offspring_sigma(
         _, offspring_sigma = predict_with_gp(gp_surrogates, offspring_x)
         return offspring_sigma.astype(np.float32)
 
-    if surrogate_model != "knn":
+    if surrogate_model not in {"knn", "kan"}:
         raise ValueError(f"Unsupported surrogate_model: {surrogate_model}")
 
     archive_pred = predict_with_kan(kan_surrogates, uncertainty_x, device).astype(np.float32)
@@ -1472,8 +1492,8 @@ def parse_args():
         dest="surrogate_model",
         type=str,
         default="gp",
-        choices=["gp", "knn"],
-        help="Auxiliary surrogate model for DeepIC sigma input: gp=frozen Gaussian process on the initial archive, knn=local residual KNN on the uncertainty archive.",
+        choices=["gp", "knn", "kan"],
+        help="Surrogate mode: gp=use GP for surrogate predictions/uncertainty, knn=KAN preds + KNN residual uncertainty, kan=same as knn (explicit KAN).",
     )
     parser.add_argument(
         "--uncertainty_model",

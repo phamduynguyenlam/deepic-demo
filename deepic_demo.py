@@ -96,11 +96,16 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
     problem = base.nda.ZDTProblem(name=target_problem, dim=args.dim)
     ref_point = base.nsga_eic._reference_point(target_problem, args.dim)
 
-    pretrain_entry = base.load_or_prepare_kan_surrogate(target_problem, args.dim, args)
-    pretrain_x = pretrain_entry["x"]
-    pretrain_y = pretrain_entry["y"]
-    surrogates = pretrain_entry["models"]
-    print(f"Prepared KAN surrogate on {target_problem}-{args.dim}D with {pretrain_x.shape[0]} samples.")
+    surrogate_mode = demo.surrogate_model_name(args)
+    pretrain_x = pretrain_y = None
+    kan_surrogates = None
+    gp_surrogates = None
+    if surrogate_mode != "gp":
+        pretrain_entry = base.load_or_prepare_kan_surrogate(target_problem, args.dim, args)
+        pretrain_x = pretrain_entry["x"]
+        pretrain_y = pretrain_entry["y"]
+        kan_surrogates = pretrain_entry["models"]
+        print(f"Prepared KAN surrogate on {target_problem}-{args.dim}D with {pretrain_x.shape[0]} samples.")
 
     if initial_archive_x is None:
         archive_x = base.latin_hypercube_sample(
@@ -116,14 +121,15 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             raise ValueError("initial_archive_x must have shape (archive_size, dim).")
 
     archive_y = problem.evaluate(archive_x)
-    uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
-    gp_surrogates = None
-    if demo.surrogate_model_name(args) == "gp":
+    uncertainty_x = uncertainty_y = None
+    if surrogate_mode == "gp":
         gp_surrogates = demo.fit_gp_surrogates(
-            archive_x=uncertainty_x,
-            archive_y=uncertainty_y,
+            archive_x=archive_x,
+            archive_y=archive_y,
             seed=args.seed + base._stable_seed(71, target_problem, args.dim),
         )
+    else:
+        uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
     true_evals = args.archive_size
     steps_to_run = (args.max_fe - true_evals) // args.k_eval
     hv_history = []
@@ -142,24 +148,40 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
     for step in range(steps_to_run):
         surrogate_seed_x = _select_surrogate_seed_archive(archive_x=archive_x, archive_y=archive_y)
 
-        offspring_x, offspring_pred = base.nsga_eic.generate_nsga2_pseudo_front(
-            archive_x=surrogate_seed_x,
-            problem=problem,
-            surrogates=surrogates,
-            device=args.device,
-            n_offspring=SURROGATE_WORKING_SIZE,
-            sigma=args.mutation_sigma,
-            surrogate_nsga_steps=args.surrogate_nsga_steps,
-            predict_fn=demo.predict_with_kan,
-            generate_fn=demo.generate_offspring,
-        )
+        if surrogate_mode == "gp":
+            if gp_surrogates is None:
+                raise ValueError("GP surrogate requested but gp_surrogates is None.")
+            offspring_x, offspring_pred = base.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=surrogate_seed_x,
+                problem=problem,
+                surrogates=gp_surrogates,
+                device=args.device,
+                n_offspring=SURROGATE_WORKING_SIZE,
+                sigma=args.mutation_sigma,
+                surrogate_nsga_steps=args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_gp_mean,
+                generate_fn=demo.generate_offspring,
+            )
+        else:
+            if kan_surrogates is None:
+                raise ValueError("KAN surrogate requested but kan_surrogates is None.")
+            offspring_x, offspring_pred = base.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=surrogate_seed_x,
+                problem=problem,
+                surrogates=kan_surrogates,
+                device=args.device,
+                n_offspring=SURROGATE_WORKING_SIZE,
+                sigma=args.mutation_sigma,
+                surrogate_nsga_steps=args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_kan,
+                generate_fn=demo.generate_offspring,
+            )
         offspring_x, offspring_pred = _trim_population(offspring_x, offspring_pred, SURROGATE_WORKING_SIZE)
 
-        if gp_surrogates is not None:
-            _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
-            offspring_sigma = offspring_sigma.astype(np.float32)
+        if surrogate_mode == "gp":
+            offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
         else:
-            archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
+            archive_pred = demo.predict_with_kan(kan_surrogates, uncertainty_x, args.device).astype(np.float32)
             offspring_sigma = demo.estimate_uncertainty(
                 archive_x=uncertainty_x,
                 archive_y=uncertainty_y,
@@ -221,17 +243,24 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         if true_evals >= args.max_fe:
             break
 
-        combined_x = np.vstack([pretrain_x, archive_x])
-        combined_y = np.vstack([pretrain_y, archive_y])
-        surrogates = demo.fit_kan_surrogates(
-            archive_x=combined_x,
-            archive_y=combined_y,
-            device=args.device,
-            kan_steps=args.kan_steps,
-            hidden_width=args.kan_hidden,
-            grid=args.kan_grid,
-            seed=args.seed + 200 + step,
-        )
+        if surrogate_mode == "gp":
+            gp_surrogates = demo.fit_gp_surrogates(
+                archive_x=archive_x,
+                archive_y=archive_y,
+                seed=args.seed + 200 + step,
+            )
+        else:
+            combined_x = np.vstack([pretrain_x, archive_x])
+            combined_y = np.vstack([pretrain_y, archive_y])
+            kan_surrogates = demo.fit_kan_surrogates(
+                archive_x=combined_x,
+                archive_y=combined_y,
+                device=args.device,
+                kan_steps=args.kan_steps,
+                hidden_width=args.kan_hidden,
+                grid=args.kan_grid,
+                seed=args.seed + 200 + step,
+            )
 
     fronts, _ = demo.fast_non_dominated_sort(archive_y)
     final_front = archive_y[np.asarray(fronts[0], dtype=np.int64)]

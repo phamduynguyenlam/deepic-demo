@@ -463,14 +463,17 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     seed=args.seed + epoch * 10000 + multisource._stable_seed(0, problem_name, dim),
                 )
                 archive_y = problem.evaluate(archive_x)
-                uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+                surrogate_mode = multisource._surrogate_model_name(args)
+                uncertainty_x = uncertainty_y = None
                 gp_surrogates = None
-                if multisource._surrogate_model_name(args) == "gp":
+                if surrogate_mode == "gp":
                     gp_surrogates = demo.fit_gp_surrogates(
-                        archive_x=uncertainty_x,
-                        archive_y=uncertainty_y,
+                        archive_x=archive_x,
+                        archive_y=archive_y,
                         seed=args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim),
                     )
+                else:
+                    uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
 
                 true_evals = args.archive_size
                 remaining_budget = args.max_fe - true_evals
@@ -480,21 +483,33 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     archive_x_t = archive_x.copy()
                     archive_y_t = archive_y.copy()
 
-                    offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
-                        archive_x=archive_x_t,
-                        problem=problem,
-                        surrogates=surrogates,
-                        device=args.device,
-                        n_offspring=args.offspring_size,
-                        sigma=args.mutation_sigma,
-                        surrogate_nsga_steps=args.surrogate_nsga_steps,
-                        predict_fn=demo.predict_with_kan,
-                        generate_fn=demo.generate_offspring,
-                    )
-                    if gp_surrogates is not None:
-                        _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
-                        offspring_sigma = offspring_sigma.astype(np.float32)
+                    if surrogate_mode == "gp":
+                        if gp_surrogates is None:
+                            raise ValueError("GP surrogate requested but gp_surrogates is None.")
+                        offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                            archive_x=archive_x_t,
+                            problem=problem,
+                            surrogates=gp_surrogates,
+                            device=args.device,
+                            n_offspring=args.offspring_size,
+                            sigma=args.mutation_sigma,
+                            surrogate_nsga_steps=args.surrogate_nsga_steps,
+                            predict_fn=demo.predict_with_gp_mean,
+                            generate_fn=demo.generate_offspring,
+                        )
+                        offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
                     else:
+                        offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                            archive_x=archive_x_t,
+                            problem=problem,
+                            surrogates=surrogates,
+                            device=args.device,
+                            n_offspring=args.offspring_size,
+                            sigma=args.mutation_sigma,
+                            surrogate_nsga_steps=args.surrogate_nsga_steps,
+                            predict_fn=demo.predict_with_kan,
+                            generate_fn=demo.generate_offspring,
+                        )
                         archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
                         offspring_sigma = demo.estimate_uncertainty(
                             archive_x=uncertainty_x,
@@ -583,12 +598,19 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                         new_x=selected_x,
                         new_y=selected_y,
                     )
-                    uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
-                        uncertainty_x=uncertainty_x,
-                        uncertainty_y=uncertainty_y,
-                        new_x=selected_x,
-                        new_y=selected_y,
-                    )
+                    if surrogate_mode == "gp":
+                        gp_surrogates = demo.fit_gp_surrogates(
+                            archive_x=archive_x,
+                            archive_y=archive_y,
+                            seed=args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim) + step + 1,
+                        )
+                    else:
+                        uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                            uncertainty_x=uncertainty_x,
+                            uncertainty_y=uncertainty_y,
+                            new_x=selected_x,
+                            new_y=selected_y,
+                        )
 
                     true_evals += selected_x.shape[0]
                     if true_evals >= args.max_fe:
@@ -764,11 +786,16 @@ def run_saea_icw_problem(
     problem = multisource.nda.ZDTProblem(name=target_problem, dim=args.dim)
     ref_point = multisource.nsga_eic._reference_point(target_problem, args.dim)
 
-    pretrain_entry = multisource.load_or_prepare_kan_surrogate(target_problem, args.dim, args)
-    pretrain_x = pretrain_entry["x"]
-    pretrain_y = pretrain_entry["y"]
-    surrogates = pretrain_entry["models"]
-    print(f"Prepared KAN surrogate on {target_problem}-{args.dim}D with {pretrain_x.shape[0]} samples.")
+    surrogate_mode = demo.surrogate_model_name(args)
+    pretrain_x = pretrain_y = None
+    kan_surrogates = None
+    gp_surrogates = None
+    if surrogate_mode != "gp":
+        pretrain_entry = multisource.load_or_prepare_kan_surrogate(target_problem, args.dim, args)
+        pretrain_x = pretrain_entry["x"]
+        pretrain_y = pretrain_entry["y"]
+        kan_surrogates = pretrain_entry["models"]
+        print(f"Prepared KAN surrogate on {target_problem}-{args.dim}D with {pretrain_x.shape[0]} samples.")
 
     if initial_archive_x is None:
         archive_x = multisource.latin_hypercube_sample(
@@ -784,14 +811,15 @@ def run_saea_icw_problem(
             raise ValueError("initial_archive_x must have shape (archive_size, dim).")
 
     archive_y = problem.evaluate(archive_x)
-    uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
-    gp_surrogates = None
-    if demo.surrogate_model_name(args) == "gp":
+    uncertainty_x = uncertainty_y = None
+    if surrogate_mode == "gp":
         gp_surrogates = demo.fit_gp_surrogates(
-            archive_x=uncertainty_x,
-            archive_y=uncertainty_y,
+            archive_x=archive_x,
+            archive_y=archive_y,
             seed=args.seed + multisource._stable_seed(89, target_problem, args.dim),
         )
+    else:
+        uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
 
     true_evals = args.archive_size
     hv_history: list[float] = []
@@ -811,28 +839,44 @@ def run_saea_icw_problem(
     while true_evals < args.max_fe:
         surrogate_seed_x = base_demo._select_surrogate_seed_archive(archive_x=archive_x, archive_y=archive_y)
 
-        offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
-            archive_x=surrogate_seed_x,
-            problem=problem,
-            surrogates=surrogates,
-            device=args.device,
-            n_offspring=base_demo.SURROGATE_WORKING_SIZE,
-            sigma=args.mutation_sigma,
-            surrogate_nsga_steps=args.surrogate_nsga_steps,
-            predict_fn=demo.predict_with_kan,
-            generate_fn=demo.generate_offspring,
-        )
+        if surrogate_mode == "gp":
+            if gp_surrogates is None:
+                raise ValueError("GP surrogate requested but gp_surrogates is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=surrogate_seed_x,
+                problem=problem,
+                surrogates=gp_surrogates,
+                device=args.device,
+                n_offspring=base_demo.SURROGATE_WORKING_SIZE,
+                sigma=args.mutation_sigma,
+                surrogate_nsga_steps=args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_gp_mean,
+                generate_fn=demo.generate_offspring,
+            )
+        else:
+            if kan_surrogates is None:
+                raise ValueError("KAN surrogate requested but kan_surrogates is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=surrogate_seed_x,
+                problem=problem,
+                surrogates=kan_surrogates,
+                device=args.device,
+                n_offspring=base_demo.SURROGATE_WORKING_SIZE,
+                sigma=args.mutation_sigma,
+                surrogate_nsga_steps=args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_kan,
+                generate_fn=demo.generate_offspring,
+            )
         offspring_x, offspring_pred = base_demo._trim_population(
             offspring_x,
             offspring_pred,
             base_demo.SURROGATE_WORKING_SIZE,
         )
 
-        if gp_surrogates is not None:
-            _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
-            offspring_sigma = offspring_sigma.astype(np.float32)
+        if surrogate_mode == "gp":
+            offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
         else:
-            archive_pred = demo.predict_with_kan(surrogates, uncertainty_x, args.device).astype(np.float32)
+            archive_pred = demo.predict_with_kan(kan_surrogates, uncertainty_x, args.device).astype(np.float32)
             offspring_sigma = demo.estimate_uncertainty(
                 archive_x=uncertainty_x,
                 archive_y=uncertainty_y,
@@ -884,12 +928,13 @@ def run_saea_icw_problem(
             new_x=selected_x,
             new_y=selected_y,
         )
-        uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
-            uncertainty_x=uncertainty_x,
-            uncertainty_y=uncertainty_y,
-            new_x=selected_x,
-            new_y=selected_y,
-        )
+        if surrogate_mode != "gp":
+            uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                uncertainty_x=uncertainty_x,
+                uncertainty_y=uncertainty_y,
+                new_x=selected_x,
+                new_y=selected_y,
+            )
 
         fronts, _ = demo.fast_non_dominated_sort(archive_y)
         front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
@@ -907,17 +952,24 @@ def run_saea_icw_problem(
         if true_evals >= args.max_fe:
             break
 
-        combined_x = np.vstack([pretrain_x, archive_x])
-        combined_y = np.vstack([pretrain_y, archive_y])
-        surrogates = demo.fit_kan_surrogates(
-            archive_x=combined_x,
-            archive_y=combined_y,
-            device=args.device,
-            kan_steps=args.kan_steps,
-            hidden_width=args.kan_hidden,
-            grid=args.kan_grid,
-            seed=args.seed + 300 + step_idx,
-        )
+        if surrogate_mode == "gp":
+            gp_surrogates = demo.fit_gp_surrogates(
+                archive_x=archive_x,
+                archive_y=archive_y,
+                seed=args.seed + 300 + step_idx,
+            )
+        else:
+            combined_x = np.vstack([pretrain_x, archive_x])
+            combined_y = np.vstack([pretrain_y, archive_y])
+            kan_surrogates = demo.fit_kan_surrogates(
+                archive_x=combined_x,
+                archive_y=combined_y,
+                device=args.device,
+                kan_steps=args.kan_steps,
+                hidden_width=args.kan_hidden,
+                grid=args.kan_grid,
+                seed=args.seed + 300 + step_idx,
+            )
 
     fronts, _ = demo.fast_non_dominated_sort(archive_y)
     final_front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
