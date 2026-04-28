@@ -459,14 +459,35 @@ def _subsample_archive_for_model(
 ) -> tuple[np.ndarray, np.ndarray]:
     archive_x = np.asarray(archive_x, dtype=np.float32)
     archive_y = np.asarray(archive_y, dtype=np.float32)
+    n_keep = int(n_keep)
 
-    if archive_x.shape[0] <= int(n_keep):
+    if archive_x.shape[0] != archive_y.shape[0]:
+        raise ValueError(
+            f"archive_x and archive_y must have the same number of rows, got {archive_x.shape[0]} and {archive_y.shape[0]}."
+        )
+
+    if n_keep <= 0:
+        raise ValueError(f"n_keep must be positive, got {n_keep}.")
+
+    def _repeat_to_length(arr: np.ndarray, target_rows: int) -> np.ndarray:
+        n_rows = int(arr.shape[0])
+        if n_rows == target_rows:
+            return arr
+        if n_rows == 0:
+            raise ValueError("Cannot pad an empty archive.")
+        idx = np.arange(int(target_rows), dtype=np.int64) % n_rows
+        return arr[idx]
+
+    if archive_x.shape[0] < n_keep:
+        return _repeat_to_length(archive_x, n_keep), _repeat_to_length(archive_y, n_keep)
+
+    if archive_x.shape[0] == n_keep:
         return archive_x, archive_y
 
     selected_x, selected_y = nsga_eic._nsga2_survival(
         archive_x,
         archive_y,
-        n_keep=int(n_keep),
+        n_keep=n_keep,
     )
     return selected_x.astype(np.float32), selected_y.astype(np.float32)
 
