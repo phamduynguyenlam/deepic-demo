@@ -402,12 +402,10 @@ def update_archive(
     new_x: np.ndarray,
     new_y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Update archive by merging new solutions and removing dominated ones.
-    
-    Workflow:
-    1. Add all new solutions to archive (merge)
-    2. Remove all dominated solutions (batch operation)
-    3. Return result (no truncation)
+    """Append new true-evaluated solutions to the archive.
+
+    In inference/evaluation flows we keep *all* evaluated individuals (including
+    dominated ones) instead of maintaining a Pareto-only archive.
     """
     archive_x = np.asarray(archive_x)
     archive_y = np.asarray(archive_y)
@@ -417,43 +415,10 @@ def update_archive(
     if new_x.size == 0 or new_y.size == 0:
         return archive_x, archive_y
 
-    # Step 1: Merge all solutions
-    if archive_x.shape[0] == 0:
-        merged_x = new_x
-        merged_y = new_y
-    else:
-        merged_x = np.vstack([archive_x, new_x])
-        merged_y = np.vstack([archive_y, new_y])
+    if archive_x.size == 0:
+        return new_x, new_y
 
-    # Step 2: Remove duplicates
-    unique_indices = []
-    for i in range(merged_y.shape[0]):
-        is_duplicate = False
-        for j in range(i):
-            if j in unique_indices and np.allclose(merged_y[i], merged_y[j]):
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_indices.append(i)
-    
-    merged_x = merged_x[unique_indices]
-    merged_y = merged_y[unique_indices]
-
-    # Step 3: Remove all dominated solutions (batch operation)
-    n = merged_y.shape[0]
-    keep = np.ones(n, dtype=bool)
-    
-    for i in range(n):
-        for j in range(n):
-            if i != j and keep[i]:  # If i not already marked for removal
-                if dominates(merged_y[j], merged_y[i]):
-                    keep[i] = False
-                    break
-    
-    result_x = merged_x[keep]
-    result_y = merged_y[keep]
-
-    return result_x, result_y
+    return np.vstack([archive_x, new_x]), np.vstack([archive_y, new_y])
 
 
 def adapt_deepic(
@@ -783,8 +748,9 @@ def hypervolume_2d(pareto: np.ndarray, ref: np.ndarray) -> float:
         Hypervolume value
         
     Note:
-        With a fixed reference point and proper archive updates (only non-dominated solutions),
-        HV should monotonically increase or stay the same during optimization.
+        HV is computed on the non-dominated front (pass a Pareto-front array),
+        so with a fixed reference point it should monotonically increase or stay
+        the same during optimization.
     """
     if pareto.size == 0 or len(pareto) == 0:
         return 0.0

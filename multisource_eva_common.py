@@ -1595,7 +1595,7 @@ def parse_args(target_problem: str, argv=None):
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
+    parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
     parser.add_argument("--discount", type=float, default=1.0, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--train_algo", type=str, default="reinforce", choices=["reinforce", "ppo"])
     parser.add_argument("--ppo_epochs", type=int, default=8)

@@ -160,7 +160,7 @@ def parse_args():
     parser.add_argument("--dim", type=int, default=30)
     parser.add_argument("--archive_size", type=int, default=80)
     parser.add_argument("--offspring_size", type=int, default=24)
-    parser.add_argument("--k_eval", type=int, default=5)
+    parser.add_argument("--k_eval", type=int, default=3)
     parser.add_argument("--max_fe", type=int, default=120)
     parser.add_argument("--mutation_sigma", type=float, default=0.12)
     parser.add_argument("--kan_steps", type=int, default=25)
@@ -171,7 +171,7 @@ def parse_args():
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
+    parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
@@ -322,8 +322,6 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
     nda.set_seed(args.seed)
     if args.max_fe < args.archive_size:
         raise ValueError("max_fe must be at least as large as archive_size.")
-    if (args.max_fe - args.archive_size) % args.k_eval != 0:
-        raise ValueError("max_fe - archive_size must be divisible by k_eval.")
 
     problem = nda.ZDTProblem(name=problem_name, dim=args.dim)
     ref_point = _reference_point(problem_name, args.dim)
@@ -355,8 +353,6 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
     selector = EIC(seed=args.seed)
 
     true_evals = args.archive_size
-    remaining_budget = args.max_fe - true_evals
-    steps_to_run = remaining_budget // args.k_eval
     hv_history: list[float] = []
     reward_history: list[float] = []
 
@@ -370,7 +366,8 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
         f"front0={front.shape[0]} | HV={initial_hv:.6f}"
     )
 
-    for step in range(steps_to_run):
+    step = 0
+    while true_evals < args.max_fe:
         offspring_x, offspring_pred = generate_nsga2_pseudo_front(
             archive_x=archive_x,
             problem=problem,
@@ -390,12 +387,14 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
             offspring_x=offspring_x,
         ).astype(np.float32)
 
+        remaining_budget = args.max_fe - true_evals
+        n_select = int(min(args.k_eval, remaining_budget))
         selected = selector.select(
             offspring_x=offspring_x,
             offspring_pred=offspring_pred,
             archive_pred=archive_y,
             offspring_sigma=offspring_sigma,
-            n_select=args.k_eval,
+            n_select=n_select,
         )
         selected_idx = selected.indices
         selected_x = offspring_x[selected_idx]
@@ -426,10 +425,6 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
             f"front0={front.shape[0]} | HV={hv_value:.6f} | reward={reward_value:.6f} | pseudo_front={offspring_x.shape[0]}"
         )
 
-        true_evals += args.k_eval
-        if true_evals >= args.max_fe:
-            break
-
         combined_x = np.vstack([pretrain_x, archive_x])
         combined_y = np.vstack([pretrain_y, archive_y])
         surrogates = nda.fit_kan_surrogates(
@@ -441,6 +436,9 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
             grid=args.kan_grid,
             seed=args.seed + 100 + step,
         )
+
+        true_evals += n_select
+        step += 1
 
     fronts, _ = nda.fast_non_dominated_sort(archive_y)
     final_front = archive_y[np.asarray(fronts[0], dtype=np.int64)]

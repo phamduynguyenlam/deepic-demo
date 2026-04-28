@@ -393,39 +393,11 @@ def update_archive(
     if new_x.size == 0 or new_y.size == 0:
         return archive_x, archive_y
 
-    keep_new = np.ones(new_y.shape[0], dtype=bool)
-    for i in range(new_y.shape[0]):
-        if not keep_new[i]:
-            continue
-        for j in range(new_y.shape[0]):
-            if i == j or not keep_new[j]:
-                continue
-            if dominates(new_y[j], new_y[i]):
-                keep_new[i] = False
-                break
+    if archive_x.size == 0:
+        return new_x, new_y
 
-    filtered_new_x = new_x[keep_new]
-    filtered_new_y = new_y[keep_new]
-
-    for candidate_x, candidate_y in zip(filtered_new_x, filtered_new_y):
-        dominated_by_archive = np.any(
-            np.all(archive_y <= candidate_y, axis=1) & np.any(archive_y < candidate_y, axis=1)
-        )
-        duplicate_in_archive = np.any(np.all(np.isclose(archive_y, candidate_y), axis=1))
-        if dominated_by_archive or duplicate_in_archive:
-            continue
-
-        keep_archive = ~(
-            np.all(candidate_y <= archive_y, axis=1) &
-            np.any(candidate_y < archive_y, axis=1)
-        )
-        archive_x = archive_x[keep_archive]
-        archive_y = archive_y[keep_archive]
-
-        archive_x = np.vstack([archive_x, candidate_x[None, :]])
-        archive_y = np.vstack([archive_y, candidate_y[None, :]])
-
-    return archive_x, archive_y
+    # Keep all true-evaluated individuals (including dominated ones).
+    return np.vstack([archive_x, new_x]), np.vstack([archive_y, new_y])
 
 
 def hypervolume_2d(pareto: np.ndarray, ref: np.ndarray) -> float:
@@ -539,7 +511,7 @@ def parse_args():
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
+    parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")

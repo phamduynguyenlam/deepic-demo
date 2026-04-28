@@ -832,7 +832,7 @@ def parse_args(target_problem: str):
     parser.add_argument("--deepic_ff", type=int, default=128)
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
-    parser.add_argument("--surrogate_nsga_steps", type=int, default=100)
+    parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
     parser.add_argument("--hv_epsilon", type=float, default=1e-8)
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
