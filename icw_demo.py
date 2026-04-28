@@ -797,8 +797,6 @@ def run_saea_icw_problem(
     hv_history: list[float] = []
     reward_history: list[float] = []
 
-    surrogate_archive_x, surrogate_archive_y = base_demo._initialize_surrogate_archive(args, problem, surrogates, archive_x)
-
     fronts, _ = demo.fast_non_dominated_sort(archive_y)
     front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
     initial_hv = demo.hypervolume_2d(front, ref_point)
@@ -806,18 +804,12 @@ def run_saea_icw_problem(
     print(
         f"Init    | archive={archive_x.shape[0]} | "
         f"front0={front.shape[0]} | HV={initial_hv:.6f} | "
-        f"surrogate_archive={surrogate_archive_x.shape[0]}"
+        f"seed_archive={min(base_demo.SURROGATE_WORKING_SIZE, archive_x.shape[0])}"
     )
 
     step_idx = 0
     while true_evals < args.max_fe:
-        surrogate_seed_x = base_demo._select_surrogate_seed_archive(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            previous_surrogate_x=surrogate_archive_x,
-            surrogates=surrogates,
-            device=args.device,
-        )
+        surrogate_seed_x = base_demo._select_surrogate_seed_archive(archive_x=archive_x, archive_y=archive_y)
 
         offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
             archive_x=surrogate_seed_x,
@@ -835,8 +827,6 @@ def run_saea_icw_problem(
             offspring_pred,
             base_demo.SURROGATE_WORKING_SIZE,
         )
-        surrogate_archive_x = offspring_x.copy()
-        surrogate_archive_y = offspring_pred.copy()
 
         if gp_surrogates is not None:
             _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
@@ -909,7 +899,7 @@ def run_saea_icw_problem(
         print(
             f"Iter {step_idx + 1:02d} | archive={archive_x.shape[0]} | "
             f"front0={front.shape[0]} | HV={hv_value:.6f} | reward={reward_value:.6f} | "
-            f"seed_archive={surrogate_seed_x.shape[0]} | surrogate_archive={surrogate_archive_x.shape[0]}"
+            f"seed_archive={surrogate_seed_x.shape[0]}"
         )
 
         true_evals += selected_x.shape[0]
@@ -958,8 +948,6 @@ def run_saea_icw_problem(
         "hv_history": hv_history,
         "reward_history": reward_history,
         "ref_point": ref_point,
-        "surrogate_archive_x": surrogate_archive_x,
-        "surrogate_archive_y": surrogate_archive_y,
     }
 
 

@@ -55,9 +55,6 @@ def _trim_population(x: np.ndarray, y: np.ndarray, n_keep: int) -> tuple[np.ndar
 def _select_surrogate_seed_archive(
     archive_x: np.ndarray,
     archive_y: np.ndarray,
-    previous_surrogate_x: np.ndarray | None,
-    surrogates,
-    device: str,
 ) -> np.ndarray:
     archive_x = np.asarray(archive_x, dtype=np.float32)
     archive_y = np.asarray(archive_y, dtype=np.float32)
@@ -70,24 +67,13 @@ def _select_surrogate_seed_archive(
         )
         return selected_x.astype(np.float32)
 
-    seeds = archive_x.copy()
-    missing = SURROGATE_WORKING_SIZE - seeds.shape[0]
-
-    if missing > 0 and previous_surrogate_x is not None:
-        fallback_x = _filter_unique_rows(previous_surrogate_x, existing=archive_x)
-        if fallback_x.shape[0] > 0:
-            fallback_y = demo.predict_with_kan(surrogates, fallback_x, device).astype(np.float32)
-            supplement_x, _ = _trim_population(fallback_x, fallback_y, missing)
-            seeds = np.vstack([seeds, supplement_x]).astype(np.float32)
-            missing = SURROGATE_WORKING_SIZE - seeds.shape[0]
-
-    if missing > 0:
-        raise ValueError(
-            f"Unable to assemble {SURROGATE_WORKING_SIZE} surrogate NSGA seeds "
-            f"(archive={archive_x.shape[0]})."
-        )
-
-    return seeds.astype(np.float32)
+    # In the SAEA-DeepIC demos we always start from a true-evaluated archive
+    # that is at least `SURROGATE_WORKING_SIZE`. If you change archive sizing,
+    # you must ensure the true archive has enough points.
+    raise ValueError(
+        f"Unable to assemble {SURROGATE_WORKING_SIZE} surrogate NSGA seeds "
+        f"from true archive only (archive={archive_x.shape[0]})."
+    )
 
 
 def _initialize_surrogate_archive(args, problem, surrogates, archive_x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -143,8 +129,6 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
     hv_history = []
     reward_history = []
 
-    surrogate_archive_x, surrogate_archive_y = _initialize_surrogate_archive(args, problem, surrogates, archive_x)
-
     fronts, _ = demo.fast_non_dominated_sort(archive_y)
     front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
     initial_hv = demo.hypervolume_2d(front, ref_point)
@@ -152,17 +136,11 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
     print(
         f"Init    | archive={archive_x.shape[0]} | "
         f"front0={front.shape[0]} | HV={initial_hv:.6f} | "
-        f"surrogate_archive={surrogate_archive_x.shape[0]}"
+        f"seed_archive={min(SURROGATE_WORKING_SIZE, archive_x.shape[0])}"
     )
 
     for step in range(steps_to_run):
-        surrogate_seed_x = _select_surrogate_seed_archive(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            previous_surrogate_x=surrogate_archive_x,
-            surrogates=surrogates,
-            device=args.device,
-        )
+        surrogate_seed_x = _select_surrogate_seed_archive(archive_x=archive_x, archive_y=archive_y)
 
         offspring_x, offspring_pred = base.nsga_eic.generate_nsga2_pseudo_front(
             archive_x=surrogate_seed_x,
@@ -176,8 +154,6 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             generate_fn=demo.generate_offspring,
         )
         offspring_x, offspring_pred = _trim_population(offspring_x, offspring_pred, SURROGATE_WORKING_SIZE)
-        surrogate_archive_x = offspring_x.copy()
-        surrogate_archive_y = offspring_pred.copy()
 
         if gp_surrogates is not None:
             _, offspring_sigma = demo.predict_with_gp(gp_surrogates, offspring_x)
@@ -238,7 +214,7 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         print(
             f"Iter {step + 1:02d} | archive={archive_x.shape[0]} | "
             f"front0={front.shape[0]} | HV={hv_value:.6f} | reward={reward_value:.6f} | "
-            f"seed_archive={surrogate_seed_x.shape[0]} | surrogate_archive={surrogate_archive_x.shape[0]}"
+            f"seed_archive={surrogate_seed_x.shape[0]}"
         )
 
         true_evals += args.k_eval
@@ -286,8 +262,6 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
         "hv_history": hv_history,
         "reward_history": reward_history,
         "ref_point": ref_point,
-        "surrogate_archive_x": surrogate_archive_x,
-        "surrogate_archive_y": surrogate_archive_y,
     }
 
 
@@ -348,10 +322,10 @@ def main():
     if args.dim != 30:
         print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
-    if args.archive_size != INITIAL_SURROGATE_ARCHIVE_SIZE:
-        print(
-            f"Warning: this demo initializes a surrogate archive of {INITIAL_SURROGATE_ARCHIVE_SIZE} "
-            f"individuals while archive_size={args.archive_size}."
+    if args.archive_size < SURROGATE_WORKING_SIZE:
+        raise ValueError(
+            f"archive_size must be at least {SURROGATE_WORKING_SIZE} when generating offspring from the true archive "
+            f"(got archive_size={args.archive_size})."
         )
 
     if args.train_only:
