@@ -1776,6 +1776,31 @@ def parse_args(target_problem: str, argv=None):
     parser.add_argument("--ppo_grad_clip", type=float, default=1.0)
     parser.add_argument("--ppo_target_kl", type=float, default=0.02)
     parser.add_argument(
+        "--ppo_adv_clip",
+        type=float,
+        default=2.0,
+        help="Optional advantage clipping magnitude for PPO (used by ICW/DeepIC PPO trainers).",
+    )
+    parser.add_argument(
+        "--ppo_parallel_workers",
+        type=int,
+        default=1,
+        help="Parallel workers for centralized PPO rollouts (used by icw_eva.py).",
+    )
+    parser.add_argument(
+        "--centralized_train_dims",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Decision dimensions to include in centralized PPO training (used by icw_eva.py).",
+    )
+    parser.add_argument(
+        "--icw_weight_kl_coef",
+        type=float,
+        default=0.01,
+        help="KL-to-uniform regularization coefficient on action weights (used by ICW PPO trainers).",
+    )
+    parser.add_argument(
         "--reward_scheme",
         type=int,
         default=1,

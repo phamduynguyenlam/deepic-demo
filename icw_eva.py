@@ -787,7 +787,8 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     ppo_adv_clip = float(getattr(args, "ppo_adv_clip", 2.0))
 
     train_problems = _centralized_train_problems(target_problem)
-    train_dims = list(getattr(args, "centralized_train_dims", CENTRALIZED_TRAIN_DIMS))
+    configured_train_dims = getattr(args, "centralized_train_dims", None)
+    train_dims = list(configured_train_dims) if configured_train_dims else list(CENTRALIZED_TRAIN_DIMS)
     train_envs = [(p, int(d)) for p in train_problems for d in train_dims]
     parallel_workers = int(getattr(args, "ppo_parallel_workers", 1))
     # On Kaggle CPU, 1-2 workers are usually safer than many workers because GP/KAN
@@ -955,8 +956,8 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     multisource._save_reward_log(
         reward_log_path,
         {
-            "script": "icw_demo_centralized_ppo.py",
-            "mode": "train_icw_multisource_ppo_centralized",
+            "script": "icw_eva.py",
+            "mode": "train_icw_multisource_centralized_ppo",
             "heldout_target_problem": target_problem,
             "model_path": str(model_path),
             "training_problems": train_problems,
@@ -1305,7 +1306,9 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False) -> 
 def _parse_args(target_problem: str):
     args = multisource.parse_args(target_problem)
     if "--train_algo" not in sys.argv[1:]:
-        args.train_algo = "ppo"
+        args.train_algo = "centralized_ppo"
+    if getattr(args, "centralized_train_dims", None) is None:
+        args.centralized_train_dims = list(CENTRALIZED_TRAIN_DIMS)
     return args
 
 
@@ -1316,11 +1319,11 @@ def main():
         print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
     if args.train_only:
-        if args.train_algo != "ppo":
-            raise ValueError("icw_demo.py currently supports PPO training only.")
-        train_icw_multisource_ppo(args, target_problem, self_train_only=True)
+        if str(args.train_algo).lower() not in {"ppo", "centralized_ppo"}:
+            raise ValueError("icw_eva.py supports centralized PPO training only.")
+        train_icw_multisource_ppo(args, target_problem, self_train_only=False)
     else:
-        run_comparison(args, target_problem, self_train_only=True)
+        run_comparison(args, target_problem, self_train_only=False)
 
 
 if __name__ == "__main__":
