@@ -52,6 +52,25 @@ def _trim_population(x: np.ndarray, y: np.ndarray, n_keep: int) -> tuple[np.ndar
     return base.nsga_eic._nsga2_survival(x, y, n_keep=n_keep)
 
 
+def _subsample_archive_for_model(
+    archive_x: np.ndarray,
+    archive_y: np.ndarray,
+    n_keep: int = INITIAL_SURROGATE_ARCHIVE_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    archive_x = np.asarray(archive_x, dtype=np.float32)
+    archive_y = np.asarray(archive_y, dtype=np.float32)
+
+    if archive_x.shape[0] <= int(n_keep):
+        return archive_x, archive_y
+
+    selected_x, selected_y = base.nsga_eic._nsga2_survival(
+        archive_x,
+        archive_y,
+        n_keep=int(n_keep),
+    )
+    return selected_x.astype(np.float32), selected_y.astype(np.float32)
+
+
 def _select_surrogate_seed_archive(
     archive_x: np.ndarray,
     archive_y: np.ndarray,
@@ -190,10 +209,15 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             ).astype(np.float32)
 
         progress = float(true_evals / args.max_fe)
-        ranking = demo.infer_deepic_ranking(
-            model=deepic,
+        model_archive_x, model_archive_y = _subsample_archive_for_model(
             archive_x=archive_x,
             archive_y=archive_y,
+            n_keep=INITIAL_SURROGATE_ARCHIVE_SIZE,
+        )
+        ranking = demo.infer_deepic_ranking(
+            model=deepic,
+            archive_x=model_archive_x,
+            archive_y=model_archive_y,
             offspring_x=offspring_x,
             offspring_pred=offspring_pred,
             offspring_sigma=offspring_sigma,

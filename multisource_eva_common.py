@@ -428,6 +428,25 @@ def _bound_group_key(bound) -> tuple[float, ...]:
     return tuple(float(x) for x in bound_arr.tolist())
 
 
+def _subsample_archive_for_model(
+    archive_x: np.ndarray,
+    archive_y: np.ndarray,
+    n_keep: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    archive_x = np.asarray(archive_x, dtype=np.float32)
+    archive_y = np.asarray(archive_y, dtype=np.float32)
+
+    if archive_x.shape[0] <= int(n_keep):
+        return archive_x, archive_y
+
+    selected_x, selected_y = nsga_eic._nsga2_survival(
+        archive_x,
+        archive_y,
+        n_keep=int(n_keep),
+    )
+    return selected_x.astype(np.float32), selected_y.astype(np.float32)
+
+
 def _update_deepic_from_episode(
     model,
     optimizer,
@@ -872,10 +891,15 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
                         ).astype(np.float32)
 
                     progress = float(true_evals / args.max_fe)
-                    ranking = demo.infer_deepic_ranking(
-                        model=deepic,
+                    model_archive_x_t, model_archive_y_t = _subsample_archive_for_model(
                         archive_x=archive_x_t,
                         archive_y=archive_y_t,
+                        n_keep=int(args.archive_size),
+                    )
+                    ranking = demo.infer_deepic_ranking(
+                        model=deepic,
+                        archive_x=model_archive_x_t,
+                        archive_y=model_archive_y_t,
                         offspring_x=offspring_x,
                         offspring_pred=offspring_pred,
                         offspring_sigma=offspring_sigma,
@@ -912,8 +936,8 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
 
                     episode_trajectory.append(
                         {
-                            "archive_x": archive_x_t,
-                            "archive_y": archive_y_t,
+                            "archive_x": model_archive_x_t,
+                            "archive_y": model_archive_y_t,
                             "offspring_x": offspring_x,
                             "offspring_pred": offspring_pred,
                             "offspring_sigma": offspring_sigma,
@@ -1166,10 +1190,15 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
                         ).astype(np.float32)
 
                     progress = float(true_evals / args.max_fe)
+                    model_archive_x_t, model_archive_y_t = _subsample_archive_for_model(
+                        archive_x=archive_x_t,
+                        archive_y=archive_y_t,
+                        n_keep=int(args.archive_size),
+                    )
                     with demo.torch.no_grad():
                         encoded = deepic.encode(
-                            x_true=demo.torch.as_tensor(archive_x_t, dtype=demo.torch.float32, device=args.device),
-                            y_true=demo.torch.as_tensor(archive_y_t, dtype=demo.torch.float32, device=args.device),
+                            x_true=demo.torch.as_tensor(model_archive_x_t, dtype=demo.torch.float32, device=args.device),
+                            y_true=demo.torch.as_tensor(model_archive_y_t, dtype=demo.torch.float32, device=args.device),
                             x_sur=demo.torch.as_tensor(offspring_x, dtype=demo.torch.float32, device=args.device),
                             y_sur=demo.torch.as_tensor(offspring_pred, dtype=demo.torch.float32, device=args.device),
                             sigma_sur=demo.torch.as_tensor(offspring_sigma, dtype=demo.torch.float32, device=args.device),
@@ -1218,8 +1247,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
 
                     episode_trajectory.append(
                         {
-                            "archive_x": archive_x_t,
-                            "archive_y": archive_y_t,
+                            "archive_x": model_archive_x_t,
+                            "archive_y": model_archive_y_t,
                             "offspring_x": offspring_x,
                             "offspring_pred": offspring_pred,
                             "offspring_sigma": offspring_sigma,
@@ -1486,10 +1515,15 @@ def run_saea_deepic_problem(args, target_problem: str, deepic, plot: bool = True
             ).astype(np.float32)
 
         progress = float(true_evals / args.max_fe)
-        ranking = demo.infer_deepic_ranking(
-            model=deepic,
+        model_archive_x, model_archive_y = _subsample_archive_for_model(
             archive_x=archive_x,
             archive_y=archive_y,
+            n_keep=int(args.archive_size),
+        )
+        ranking = demo.infer_deepic_ranking(
+            model=deepic,
+            archive_x=model_archive_x,
+            archive_y=model_archive_y,
             offspring_x=offspring_x,
             offspring_pred=offspring_pred,
             offspring_sigma=offspring_sigma,

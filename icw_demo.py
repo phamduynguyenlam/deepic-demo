@@ -97,6 +97,25 @@ def _format_vector(values: np.ndarray) -> str:
     )
 
 
+def _subsample_archive_for_model(
+    archive_x: np.ndarray,
+    archive_y: np.ndarray,
+    n_keep: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    archive_x = np.asarray(archive_x, dtype=np.float32)
+    archive_y = np.asarray(archive_y, dtype=np.float32)
+
+    if archive_x.shape[0] <= int(n_keep):
+        return archive_x, archive_y
+
+    selected_x, selected_y = multisource.nsga_eic._nsga2_survival(
+        archive_x,
+        archive_y,
+        n_keep=int(n_keep),
+    )
+    return selected_x.astype(np.float32), selected_y.astype(np.float32)
+
+
 def _icw_ppo_loss(
     agent: ICW,
     batch: dict[str, torch.Tensor],
@@ -207,19 +226,61 @@ def _update_icw_from_episode_ppo(
         }
 
     model.train()
-    grouped_indices: dict[tuple[tuple[int, ...], ...], list[int]] = {}
-    for idx, sample in enumerate(episode_trajectory):
-        key = (
-            tuple(sample["archive_x"].shape),
-            tuple(sample["archive_y"].shape),
-            tuple(sample["offspring_x"].shape),
-            tuple(sample["offspring_pred"].shape),
-            tuple(sample["offspring_sigma"].shape),
-            tuple(sample["action"].shape),
-            multisource._bound_group_key(sample["lower"]),
-            multisource._bound_group_key(sample["upper"]),
-        )
-        grouped_indices.setdefault(key, []).append(idx)
+    trajectory_size = len(episode_trajectory)
+    archive_x = torch.as_tensor(
+        np.stack([np.asarray(sample["archive_x"], dtype=np.float32) for sample in episode_trajectory], axis=0),
+        dtype=torch.float32,
+        device=device,
+    )
+    archive_y = torch.as_tensor(
+        np.stack([np.asarray(sample["archive_y"], dtype=np.float32) for sample in episode_trajectory], axis=0),
+        dtype=torch.float32,
+        device=device,
+    )
+    offspring_x = torch.as_tensor(
+        np.stack([np.asarray(sample["offspring_x"], dtype=np.float32) for sample in episode_trajectory], axis=0),
+        dtype=torch.float32,
+        device=device,
+    )
+    offspring_pred = torch.as_tensor(
+        np.stack([np.asarray(sample["offspring_pred"], dtype=np.float32) for sample in episode_trajectory], axis=0),
+        dtype=torch.float32,
+        device=device,
+    )
+    offspring_sigma = torch.as_tensor(
+        np.stack([np.asarray(sample["offspring_sigma"], dtype=np.float32) for sample in episode_trajectory], axis=0),
+        dtype=torch.float32,
+        device=device,
+    )
+    progress = torch.as_tensor(
+        [float(sample["progress"]) for sample in episode_trajectory],
+        dtype=torch.float32,
+        device=device,
+    ).reshape(trajectory_size, -1)
+    actions = torch.as_tensor(
+        np.stack([np.asarray(sample["action"], dtype=np.float32) for sample in episode_trajectory], axis=0),
+        dtype=torch.float32,
+        device=device,
+    )
+    old_logprob = torch.as_tensor(
+        [float(sample["old_logprob"]) for sample in episode_trajectory],
+        dtype=torch.float32,
+        device=device,
+    )
+    advantages = torch.as_tensor(
+        [float(sample["advantage"]) for sample in episode_trajectory],
+        dtype=torch.float32,
+        device=device,
+    )
+    returns = torch.as_tensor(
+        [float(sample["return"]) for sample in episode_trajectory],
+        dtype=torch.float32,
+        device=device,
+    )
+    if trajectory_size > 1:
+        advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
+    if adv_clip is not None and float(adv_clip) > 0.0:
+        advantages = advantages.clamp(-float(adv_clip), float(adv_clip))
 
     stats = {
         "total_loss": 0.0,
@@ -241,131 +302,72 @@ def _update_icw_from_episode_ppo(
         "updates": 0.0,
     }
 
-    for indices in grouped_indices.values():
-        group_samples = [episode_trajectory[idx] for idx in indices]
-        group_size = len(group_samples)
-        if group_size == 0:
-            continue
+    lower_bound = episode_trajectory[0]["lower"]
+    upper_bound = episode_trajectory[0]["upper"]
 
-        archive_x = torch.as_tensor(
-            np.stack([sample["archive_x"] for sample in group_samples], axis=0),
-            dtype=torch.float32,
-            device=device,
-        )
-        archive_y = torch.as_tensor(
-            np.stack([sample["archive_y"] for sample in group_samples], axis=0),
-            dtype=torch.float32,
-            device=device,
-        )
-        offspring_x = torch.as_tensor(
-            np.stack([sample["offspring_x"] for sample in group_samples], axis=0),
-            dtype=torch.float32,
-            device=device,
-        )
-        offspring_pred = torch.as_tensor(
-            np.stack([sample["offspring_pred"] for sample in group_samples], axis=0),
-            dtype=torch.float32,
-            device=device,
-        )
-        offspring_sigma = torch.as_tensor(
-            np.stack([sample["offspring_sigma"] for sample in group_samples], axis=0),
-            dtype=torch.float32,
-            device=device,
-        )
-        progress = torch.as_tensor(
-            [sample["progress"] for sample in group_samples],
-            dtype=torch.float32,
-            device=device,
-        ).reshape(group_size, -1)
-        actions = torch.stack(
-            [sample["action"].to(device=device, dtype=torch.float32) for sample in group_samples],
-            dim=0,
-        )
-        old_logprob = torch.as_tensor(
-            [float(sample["old_logprob"]) for sample in group_samples],
-            dtype=torch.float32,
-            device=device,
-        )
-        advantages = torch.as_tensor(
-            [sample["advantage"] for sample in group_samples],
-            dtype=torch.float32,
-            device=device,
-        )
-        returns = torch.as_tensor(
-            [sample["return"] for sample in group_samples],
-            dtype=torch.float32,
-            device=device,
-        )
-        if group_size > 1:
-            advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
-        if adv_clip is not None and float(adv_clip) > 0.0:
-            advantages = advantages.clamp(-float(adv_clip), float(adv_clip))
+    stop_updates = False
+    for _ in range(max(int(ppo_epochs), 1)):
+        perm = torch.randperm(trajectory_size, device=device)
+        for start in range(0, trajectory_size, max(int(minibatch_size), 1)):
+            mb_idx = perm[start : start + max(int(minibatch_size), 1)]
+            if mb_idx.numel() == 0:
+                continue
 
-        stop_group_updates = False
-        for _ in range(max(int(ppo_epochs), 1)):
-            perm = torch.randperm(group_size, device=device)
-            for start in range(0, group_size, max(int(minibatch_size), 1)):
-                mb_idx = perm[start : start + max(int(minibatch_size), 1)]
-                if mb_idx.numel() == 0:
-                    continue
+            batch = {
+                "x_true": archive_x[mb_idx],
+                "y_true": archive_y[mb_idx],
+                "x_sur": offspring_x[mb_idx],
+                "y_sur": offspring_pred[mb_idx],
+                "sigma_sur": offspring_sigma[mb_idx],
+                "progress": progress[mb_idx],
+                "lower_bound": lower_bound,
+                "upper_bound": upper_bound,
+                "action": actions[mb_idx],
+                "old_logprob": old_logprob[mb_idx],
+                "advantages": advantages[mb_idx],
+                "returns": returns[mb_idx],
+            }
+            loss_dict = _icw_ppo_loss(
+                agent=model,
+                batch=batch,
+                clip_eps=clip_eps,
+                value_coef=value_coef,
+                entropy_coef=entropy_coef,
+                weight_kl_coef=weight_kl_coef,
+            )
+            optimizer.zero_grad()
+            loss_dict["total_loss"].backward()
+            if grad_clip is not None and float(grad_clip) > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+            optimizer.step()
 
-                batch = {
-                    "x_true": archive_x[mb_idx],
-                    "y_true": archive_y[mb_idx],
-                    "x_sur": offspring_x[mb_idx],
-                    "y_sur": offspring_pred[mb_idx],
-                    "sigma_sur": offspring_sigma[mb_idx],
-                    "progress": progress[mb_idx],
-                    "lower_bound": group_samples[0]["lower"],
-                    "upper_bound": group_samples[0]["upper"],
-                    "action": actions[mb_idx],
-                    "old_logprob": old_logprob[mb_idx],
-                    "advantages": advantages[mb_idx],
-                    "returns": returns[mb_idx],
-                }
-                loss_dict = _icw_ppo_loss(
-                    agent=model,
-                    batch=batch,
-                    clip_eps=clip_eps,
-                    value_coef=value_coef,
-                    entropy_coef=entropy_coef,
-                    weight_kl_coef=weight_kl_coef,
-                )
-                optimizer.zero_grad()
-                loss_dict["total_loss"].backward()
-                if grad_clip is not None and float(grad_clip) > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
-                optimizer.step()
+            adv_slice = advantages[mb_idx]
+            stats["total_loss"] += float(loss_dict["total_loss"].detach().cpu())
+            stats["actor_loss"] += float(loss_dict["actor_loss"].detach().cpu())
+            stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
+            stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
+            stats["weight_kl"] += float(loss_dict["weight_kl"].detach().cpu())
+            stats["weight_entropy"] += float(loss_dict["weight_entropy"].detach().cpu())
+            if "logit_reg" in loss_dict:
+                stats["logit_reg"] += float(loss_dict["logit_reg"].detach().cpu())
+            stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
+            stats["ratio_mean"] += float(loss_dict["ratio_mean"].detach().cpu())
+            stats["ratio_std"] += float(loss_dict["ratio_std"].detach().cpu())
+            stats["ratio_min"] += float(loss_dict["ratio_min"].detach().cpu())
+            stats["ratio_max"] += float(loss_dict["ratio_max"].detach().cpu())
+            stats["adv_mean"] += float(adv_slice.mean().detach().cpu())
+            stats["adv_std"] += float(adv_slice.std(unbiased=False).detach().cpu()) if adv_slice.numel() > 1 else 0.0
+            stats["adv_min"] += float(adv_slice.min().detach().cpu())
+            stats["adv_max"] += float(adv_slice.max().detach().cpu())
+            stats["updates"] += 1.0
 
-                adv_slice = advantages[mb_idx]
-                stats["total_loss"] += float(loss_dict["total_loss"].detach().cpu())
-                stats["actor_loss"] += float(loss_dict["actor_loss"].detach().cpu())
-                stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
-                stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
-                stats["weight_kl"] += float(loss_dict["weight_kl"].detach().cpu())
-                stats["weight_entropy"] += float(loss_dict["weight_entropy"].detach().cpu())
-                if "logit_reg" in loss_dict:
-                    stats["logit_reg"] += float(loss_dict["logit_reg"].detach().cpu())
-                stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
-                stats["ratio_mean"] += float(loss_dict["ratio_mean"].detach().cpu())
-                stats["ratio_std"] += float(loss_dict["ratio_std"].detach().cpu())
-                stats["ratio_min"] += float(loss_dict["ratio_min"].detach().cpu())
-                stats["ratio_max"] += float(loss_dict["ratio_max"].detach().cpu())
-                stats["adv_mean"] += float(adv_slice.mean().detach().cpu())
-                stats["adv_std"] += (
-                    float(adv_slice.std(unbiased=False).detach().cpu()) if adv_slice.numel() > 1 else 0.0
-                )
-                stats["adv_min"] += float(adv_slice.min().detach().cpu())
-                stats["adv_max"] += float(adv_slice.max().detach().cpu())
-                stats["updates"] += 1.0
-
-                if target_kl is not None and float(target_kl) > 0.0:
-                    approx_kl = float(loss_dict["approx_kl"].detach().cpu())
-                    if abs(approx_kl) > float(target_kl):
-                        stop_group_updates = True
-                        break
-            if stop_group_updates:
-                break
+            if target_kl is not None and float(target_kl) > 0.0:
+                approx_kl = float(loss_dict["approx_kl"].detach().cpu())
+                if abs(approx_kl) > float(target_kl):
+                    stop_updates = True
+                    break
+        if stop_updates:
+            break
 
     if stats["updates"] > 0:
         for key in [
@@ -519,11 +521,16 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                         ).astype(np.float32)
 
                     progress = float(true_evals / args.max_fe)
+                    model_archive_x_t, model_archive_y_t = _subsample_archive_for_model(
+                        archive_x=archive_x_t,
+                        archive_y=archive_y_t,
+                        n_keep=int(args.archive_size),
+                    )
                     model.eval()
                     with torch.no_grad():
                         act_out = model.act(
-                            x_true=torch.as_tensor(archive_x_t, dtype=torch.float32, device=args.device),
-                            y_true=torch.as_tensor(archive_y_t, dtype=torch.float32, device=args.device),
+                            x_true=torch.as_tensor(model_archive_x_t, dtype=torch.float32, device=args.device),
+                            y_true=torch.as_tensor(model_archive_y_t, dtype=torch.float32, device=args.device),
                             x_sur=torch.as_tensor(offspring_x, dtype=torch.float32, device=args.device),
                             y_sur=torch.as_tensor(offspring_pred, dtype=torch.float32, device=args.device),
                             sigma_sur=torch.as_tensor(offspring_sigma, dtype=torch.float32, device=args.device),
@@ -574,16 +581,20 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
 
                     episode_trajectory.append(
                         {
-                            "archive_x": archive_x_t,
-                            "archive_y": archive_y_t,
+                            "archive_x": model_archive_x_t,
+                            "archive_y": model_archive_y_t,
                             "offspring_x": offspring_x,
                             "offspring_pred": offspring_pred,
                             "offspring_sigma": offspring_sigma,
-                            "progress": progress,
+                            "progress": float(progress),
                             "lower": problem.lower,
                             "upper": problem.upper,
-                            "action": act_out["action"][0].detach().cpu(),
-                            "action_weights": act_out["action_weights"][0].detach().cpu(),
+                            "action": act_out["action"][0].detach().cpu().numpy().astype(np.float32, copy=False),
+                            "action_weights": act_out["action_weights"][0]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float32, copy=False),
                             "old_logprob": float(act_out["logprob"][0].detach().cpu()),
                             "value": current_value,
                             "next_value": 0.0,
@@ -632,7 +643,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             if dim_trajectories:
                 action_matrix = np.stack(
                     [
-                        sample["action"].detach().cpu().numpy().astype(np.float32, copy=False)
+                        np.asarray(sample["action"], dtype=np.float32)
                         for sample in dim_trajectories
                     ],
                     axis=0,
@@ -642,7 +653,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
 
                 weight_matrix = np.stack(
                     [
-                        sample["action_weights"].numpy().astype(np.float32, copy=False)
+                        np.asarray(sample["action_weights"], dtype=np.float32)
                         for sample in dim_trajectories
                     ],
                     axis=0,
@@ -885,11 +896,16 @@ def run_saea_icw_problem(
             ).astype(np.float32)
 
         progress = float(true_evals / args.max_fe)
+        model_archive_x, model_archive_y = _subsample_archive_for_model(
+            archive_x=archive_x,
+            archive_y=archive_y,
+            n_keep=int(args.archive_size),
+        )
         model.eval()
         with torch.no_grad():
             act_out = model.act(
-                x_true=torch.as_tensor(archive_x, dtype=torch.float32, device=args.device),
-                y_true=torch.as_tensor(archive_y, dtype=torch.float32, device=args.device),
+                x_true=torch.as_tensor(model_archive_x, dtype=torch.float32, device=args.device),
+                y_true=torch.as_tensor(model_archive_y, dtype=torch.float32, device=args.device),
                 x_sur=torch.as_tensor(offspring_x, dtype=torch.float32, device=args.device),
                 y_sur=torch.as_tensor(offspring_pred, dtype=torch.float32, device=args.device),
                 sigma_sur=torch.as_tensor(offspring_sigma, dtype=torch.float32, device=args.device),
