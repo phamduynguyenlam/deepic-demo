@@ -469,6 +469,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
         epoch_rewards: list[float] = []
         epoch_total_losses: list[float] = []
 
+        dim_rollout_buffers: dict[int, dict[str, object]] = {}
         for dim in multisource.SOURCE_DIMS:
             dim_trajectories: list[dict] = []
             dim_problem_count = 0
@@ -675,57 +676,59 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     f"true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0]):.6f}"
                 )
 
-            if dim_trajectories:
-                action_matrix = np.stack(
-                    [
-                        np.asarray(sample["action"], dtype=np.float32)
-                        for sample in dim_trajectories
-                    ],
-                    axis=0,
-                )
-                action_mean = action_matrix.mean(axis=0)
-                action_std = action_matrix.std(axis=0)
+            dim_rollout_buffers[int(dim)] = {
+                "trajectories": dim_trajectories,
+                "problem_count": dim_problem_count,
+            }
 
-                weight_matrix = np.stack(
-                    [
-                        np.asarray(sample["action_weights"], dtype=np.float32)
-                        for sample in dim_trajectories
-                    ],
-                    axis=0,
-                )
-                weight_mean = weight_matrix.mean(axis=0)
-                weight_std = weight_matrix.std(axis=0)
+        for dim in multisource.SOURCE_DIMS:
+            buffer = dim_rollout_buffers.get(int(dim), {})
+            dim_trajectories = list(buffer.get("trajectories", []))  # type: ignore[arg-type]
+            dim_problem_count = int(buffer.get("problem_count", 0))
+            if not dim_trajectories:
+                continue
 
-                loss_stats = _update_icw_from_episode_ppo(
-                    model=model,
-                    optimizer=optimizer,
-                    episode_trajectory=dim_trajectories,
-                    device=args.device,
-                    ppo_epochs=ppo_epochs,
-                    minibatch_size=ppo_minibatch_size,
-                    clip_eps=ppo_clip_eps,
-                    value_coef=ppo_value_coef,
-                    entropy_coef=ppo_entropy_coef,
-                    weight_kl_coef=ppo_weight_kl_coef,
-                    grad_clip=ppo_grad_clip,
-                    target_kl=ppo_target_kl,
-                    adv_clip=ppo_adv_clip,
-                )
-                epoch_total_losses.append(loss_stats["total_loss"])
-                print(
-                    f"Updated ICW PPO for {dim}D with {dim_problem_count} problems "
-                    f"({len(dim_trajectories)} rollout steps), total_loss={loss_stats['total_loss']:.6f}, "
-                    f"actor={loss_stats['actor_loss']:.6f}, critic={loss_stats['critic_loss']:.6f}, "
-                    f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}, "
-                    f"weight_kl={loss_stats.get('weight_kl', 0.0):.6f}, weight_ent={loss_stats.get('weight_entropy', 0.0):.6f}, "
-                    f"ratio_mean={loss_stats['ratio_mean']:.6f}, ratio_std={loss_stats['ratio_std']:.6f}, "
-                    f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
-                    f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
-                    f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f}, "
-                    f"logit_reg={loss_stats.get('logit_reg', 0.0):.6f}, "
-                    f"action_mean={_format_vector(action_mean)}, action_std={_format_vector(action_std)} | "
-                    f"weight_mean={_format_vector(weight_mean)}, weight_std={_format_vector(weight_std)}"
-                )
+            action_matrix = np.stack([np.asarray(sample["action"], dtype=np.float32) for sample in dim_trajectories], axis=0)
+            action_mean = action_matrix.mean(axis=0)
+            action_std = action_matrix.std(axis=0)
+
+            weight_matrix = np.stack(
+                [np.asarray(sample["action_weights"], dtype=np.float32) for sample in dim_trajectories],
+                axis=0,
+            )
+            weight_mean = weight_matrix.mean(axis=0)
+            weight_std = weight_matrix.std(axis=0)
+
+            loss_stats = _update_icw_from_episode_ppo(
+                model=model,
+                optimizer=optimizer,
+                episode_trajectory=dim_trajectories,
+                device=args.device,
+                ppo_epochs=ppo_epochs,
+                minibatch_size=ppo_minibatch_size,
+                clip_eps=ppo_clip_eps,
+                value_coef=ppo_value_coef,
+                entropy_coef=ppo_entropy_coef,
+                weight_kl_coef=ppo_weight_kl_coef,
+                grad_clip=ppo_grad_clip,
+                target_kl=ppo_target_kl,
+                adv_clip=ppo_adv_clip,
+            )
+            epoch_total_losses.append(loss_stats["total_loss"])
+            print(
+                f"Updated ICW PPO for {dim}D with {dim_problem_count} problems "
+                f"({len(dim_trajectories)} rollout steps), total_loss={loss_stats['total_loss']:.6f}, "
+                f"actor={loss_stats['actor_loss']:.6f}, critic={loss_stats['critic_loss']:.6f}, "
+                f"entropy={loss_stats['entropy_loss']:.6f}, approx_kl={loss_stats['approx_kl']:.6f}, "
+                f"weight_kl={loss_stats.get('weight_kl', 0.0):.6f}, weight_ent={loss_stats.get('weight_entropy', 0.0):.6f}, "
+                f"ratio_mean={loss_stats['ratio_mean']:.6f}, ratio_std={loss_stats['ratio_std']:.6f}, "
+                f"ratio_min={loss_stats['ratio_min']:.6f}, ratio_max={loss_stats['ratio_max']:.6f}, "
+                f"adv_mean={loss_stats['adv_mean']:.6f}, adv_std={loss_stats['adv_std']:.6f}, "
+                f"adv_min={loss_stats['adv_min']:.6f}, adv_max={loss_stats['adv_max']:.6f}, "
+                f"logit_reg={loss_stats.get('logit_reg', 0.0):.6f}, "
+                f"action_mean={_format_vector(action_mean)}, action_std={_format_vector(action_std)} | "
+                f"weight_mean={_format_vector(weight_mean)}, weight_std={_format_vector(weight_std)}"
+            )
 
         epoch_mean = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
         epoch_mean_loss = float(np.mean(epoch_total_losses)) if epoch_total_losses else 0.0
