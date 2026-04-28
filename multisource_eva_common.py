@@ -271,6 +271,30 @@ def training_problems_for(target_problem: str, self_train_only: bool = False) ->
     return source_problems_for(target_problem)
 
 
+def _select_rollout_problems(
+    target_problem: str,
+    self_train_only: bool,
+    n_rollouts: int,
+    seed: int,
+) -> list[str]:
+    pool = training_problems_for(target_problem, self_train_only=self_train_only)
+    n_rollouts = max(int(n_rollouts), 1)
+
+    if len(pool) >= n_rollouts:
+        rng = np.random.default_rng(int(seed))
+        return [str(x) for x in rng.choice(pool, size=n_rollouts, replace=False).tolist()]
+
+    selected = list(pool)
+    for problem_name in ALL_PROBLEMS:
+        if len(selected) >= n_rollouts:
+            break
+        if problem_name in selected:
+            continue
+        selected.append(problem_name)
+
+    return selected[:n_rollouts]
+
+
 def _compute_reward(
     previous_front: np.ndarray,
     selected_objectives: np.ndarray,
@@ -822,8 +846,17 @@ def train_deepic_multisource(args, target_problem: str, self_train_only: bool = 
         for dim in SOURCE_DIMS:
             dim_trajectories: list[dict] = []
             dim_problem_count = 0
-            for problem_name in training_problems_for(target_problem, self_train_only=self_train_only):
-                entry = pretrain_cache[(problem_name, dim)]
+            rollout_problems = _select_rollout_problems(
+                target_problem=target_problem,
+                self_train_only=self_train_only,
+                n_rollouts=int(getattr(args, "ppo_rollout_problems", 3)),
+                seed=args.seed + epoch * 10000 + _stable_seed(113, target_problem, dim),
+            )
+            for problem_name in rollout_problems:
+                entry = pretrain_cache.get((problem_name, dim))
+                if entry is None:
+                    entry = load_or_prepare_kan_surrogate(problem_name, dim, args)
+                    pretrain_cache[(problem_name, dim)] = entry
                 problem = entry["problem"]
                 surrogates = entry["models"]
                 episode_trajectory: list[dict] = []
@@ -1051,7 +1084,8 @@ def train_deepic_multisource_ppo(args, target_problem: str, self_train_only: boo
         f"vf_coef={getattr(args, 'ppo_value_coef', 0.03):.3f} | "
         f"target_kl={getattr(args, 'ppo_target_kl', 0.02):.3f} | "
         f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
-        f"surrogate_model={_surrogate_model_name(args)}"
+        f"surrogate_model={_surrogate_model_name(args)} | "
+        f"rollout_problems={int(getattr(args, 'ppo_rollout_problems', 3))}"
     )
     pretrain_cache = pretrain_source_surrogates(args, target_problem, self_train_only=self_train_only)
     reward_records: list[dict] = []
@@ -1708,6 +1742,12 @@ def parse_args(target_problem: str, argv=None):
     parser.add_argument("--ppo_actor_lr", type=float, default=2e-4)
     parser.add_argument("--ppo_critic_lr", type=float, default=1e-4)
     parser.add_argument("--ppo_minibatch_size", type=int, default=32)
+    parser.add_argument(
+        "--ppo_rollout_problems",
+        type=int,
+        default=3,
+        help="Number of problem rollouts to collect before each PPO update.",
+    )
     parser.add_argument("--ppo_clip_eps", type=float, default=0.2)
     parser.add_argument("--ppo_value_coef", type=float, default=0.1)
     parser.add_argument("--ppo_entropy_coef", type=float, default=0.01)

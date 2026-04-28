@@ -425,7 +425,8 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
         f"vf_coef={ppo_value_coef:.3f} | target_kl={ppo_target_kl:.4f} | "
         f"weight_kl_coef={ppo_weight_kl_coef:.4f} | adv_clip={ppo_adv_clip:.2f} | "
         f"reward_scheme={getattr(args, 'reward_scheme', 1)} | "
-        f"surrogate_model={multisource._surrogate_model_name(args)}"
+        f"surrogate_model={multisource._surrogate_model_name(args)} | "
+        f"rollout_problems={int(getattr(args, 'ppo_rollout_problems', 3))}"
     )
 
     pretrain_cache = _pretrain_target_surrogates(args, target_problem)
@@ -451,8 +452,18 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             dim_trajectories: list[dict] = []
             dim_problem_count = 0
 
-            for problem_name in [target_problem]:
-                entry = pretrain_cache[(problem_name, dim)]
+            rollout_problems = multisource._select_rollout_problems(
+                target_problem=target_problem,
+                self_train_only=self_train_only,
+                n_rollouts=int(getattr(args, "ppo_rollout_problems", 3)),
+                seed=args.seed + epoch * 10000 + multisource._stable_seed(113, target_problem, dim),
+            )
+
+            for problem_name in rollout_problems:
+                entry = pretrain_cache.get((problem_name, dim))
+                if entry is None:
+                    entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, args)
+                    pretrain_cache[(problem_name, dim)] = entry
                 problem = entry["problem"]
                 surrogates = entry["models"]
                 episode_trajectory: list[dict] = []
