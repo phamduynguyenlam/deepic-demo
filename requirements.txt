@@ -9,3 +9,4 @@ tqdm
 openpyxl
 pymoo
 tabpfn
+scikit-learn

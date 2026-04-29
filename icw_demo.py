@@ -14,6 +14,7 @@ from infill_criteria import CRITERION_NAMES, LOWER_BETTER_CRITERIA, select_indic
 import demo
 import multisource_eva_common as multisource
 import deepic_demo as base_demo
+import moead_ego as moead_ego_baseline
 
 
 DEFAULT_TARGET_PROBLEM = "ZDT1"
@@ -1215,6 +1216,13 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False, mod
         initial_archive_x=shared_init_x,
     )
 
+    moead_ego_result = moead_ego_baseline.run_moead_ego_problem(
+        args,
+        problem_name=target_problem,
+        initial_archive_x=shared_init_x,
+        config=moead_ego_baseline.MOEADEGOConfig(additional_fe=40),
+    )
+
     eic_args = multisource.build_args_namespace(args)
     eic_result = multisource.nsga_eic.run_nsga_eic_problem(
         eic_args,
@@ -1224,12 +1232,14 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False, mod
     )
 
     print(f"\nSAEA-ICW final HV: {icw_result['hv_history'][-1]:.6f}")
+    print(f"MOEAD-EGO final HV: {moead_ego_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
     print(f"Reference point: {icw_result['ref_point']}")
 
     plt.figure(figsize=(8, 5))
     plt.title(f"{args.dim}D {target_problem} Hypervolume Comparison")
     plt.plot(icw_result["hv_history"], marker="o", label="SAEA-ICW")
+    plt.plot(moead_ego_result["hv_history"], marker="^", label="MOEAD-EGO")
     plt.plot(eic_result["hv_history"], marker="s", label="NSGA-EIC")
     plt.xlabel("Step")
     plt.ylabel("Hypervolume")
