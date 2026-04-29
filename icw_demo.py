@@ -633,21 +633,21 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     )
                     selected_x = offspring_x[selected_idx]
                     if surrogate_mode == "gp":
-                        selected_pred = demo.predict_with_gp_mean(gp_surrogates, selected_x)
+                        selected_mean = demo.predict_with_gp_mean(gp_surrogates, selected_x)
                         selected_std = demo.predict_with_gp_std(gp_surrogates, selected_x)
-                        selected_var = np.square(selected_std)
                     elif surrogate_mode == "tabpfn":
-                        mean, std = tabpfn_surrogate.predict_mean_std(selected_x)
-                        selected_pred = mean
-                        selected_var = np.square(std)
+                        selected_mean, selected_std = tabpfn_surrogate.predict_mean_std(selected_x)
                     else:
-                        selected_pred = np.asarray(offspring_pred, dtype=np.float32)[selected_idx]
-                        selected_var = np.square(np.asarray(offspring_sigma, dtype=np.float32)[selected_idx])
+                        selected_mean = np.asarray(offspring_pred, dtype=np.float32)[selected_idx]
+                        selected_std = np.asarray(offspring_sigma, dtype=np.float32)[selected_idx]
+
+                    selected_y = problem.evaluate(selected_x).astype(np.float32, copy=False)
+                    abs_err = np.abs(np.asarray(selected_mean, dtype=np.float32) - np.asarray(selected_y, dtype=np.float32))
                     print(
                         f"[Surrogate check] {problem_name}-{dim}D step {step + 1:02d} "
-                        f"selected_mean={_format_matrix(selected_pred)}, selected_var={_format_matrix(selected_var)}"
+                        f"pred_mean={_format_matrix(selected_mean)}, pred_std={_format_matrix(selected_std)}, "
+                        f"true_y={_format_matrix(selected_y)}, abs_err={_format_matrix(abs_err)}"
                     )
-                    selected_y = problem.evaluate(selected_x)
 
                     reward_value = float(
                         multisource._compute_reward(
@@ -1064,21 +1064,21 @@ def run_saea_icw_problem(
         )
         selected_x = offspring_x[selected_idx]
         if surrogate_mode == "gp":
-            selected_pred = demo.predict_with_gp_mean(gp_surrogates, selected_x)
+            selected_mean = demo.predict_with_gp_mean(gp_surrogates, selected_x)
             selected_std = demo.predict_with_gp_std(gp_surrogates, selected_x)
-            selected_var = np.square(selected_std)
         elif surrogate_mode == "tabpfn":
-            mean, std = tabpfn_surrogate.predict_mean_std(selected_x)
-            selected_pred = mean
-            selected_var = np.square(std)
+            selected_mean, selected_std = tabpfn_surrogate.predict_mean_std(selected_x)
         else:
-            selected_pred = np.asarray(offspring_pred, dtype=np.float32)[selected_idx]
-            selected_var = np.square(np.asarray(offspring_sigma, dtype=np.float32)[selected_idx])
+            selected_mean = np.asarray(offspring_pred, dtype=np.float32)[selected_idx]
+            selected_std = np.asarray(offspring_sigma, dtype=np.float32)[selected_idx]
+
+        selected_y = problem.evaluate(selected_x).astype(np.float32, copy=False)
+        abs_err = np.abs(np.asarray(selected_mean, dtype=np.float32) - np.asarray(selected_y, dtype=np.float32))
         print(
             f"[Surrogate check] {target_problem}-{args.dim}D iter {step_idx + 1:02d} "
-            f"selected_mean={_format_matrix(selected_pred)}, selected_var={_format_matrix(selected_var)}"
+            f"pred_mean={_format_matrix(selected_mean)}, pred_std={_format_matrix(selected_std)}, "
+            f"true_y={_format_matrix(selected_y)}, abs_err={_format_matrix(abs_err)}"
         )
-        selected_y = problem.evaluate(selected_x)
 
         reward_value = float(
             multisource._compute_reward(

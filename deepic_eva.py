@@ -142,11 +142,14 @@ def _collect_one_deepic_env_trajectory(
     model.load_state_dict(model_state_dict)
     model.eval()
 
-    entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, worker_args)
-    problem = entry["problem"]
-    kan_surrogates = entry["models"]
-
-    surrogate_mode = multisource._surrogate_model_name(worker_args)
+    surrogate_mode = str(multisource._surrogate_model_name(worker_args)).lower()
+    kan_surrogates = None
+    if surrogate_mode in {"knn", "kan"}:
+        entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, worker_args)
+        problem = entry["problem"]
+        kan_surrogates = entry["models"]
+    else:
+        problem = multisource.nda.ZDTProblem(name=problem_name, dim=dim)
     trajectory: list[dict] = []
     reward_records: list[dict] = []
 
@@ -194,6 +197,8 @@ def _collect_one_deepic_env_trajectory(
             )
             offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
         else:
+            if kan_surrogates is None:
+                raise ValueError("KAN/KNN surrogate requested but kan_surrogates is None.")
             offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
                 archive_x=archive_x_t,
                 problem=problem,
@@ -799,8 +804,9 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
     print(f"Training problems: {train_problems}")
     print(f"Training dims: {train_dims}")
 
-    for p, d in train_envs:
-        multisource.load_or_prepare_kan_surrogate(p, d, args)
+    if str(multisource._surrogate_model_name(args)).lower() in {"knn", "kan"}:
+        for p, d in train_envs:
+            multisource.load_or_prepare_kan_surrogate(p, d, args)
 
     optimizer = multisource._build_ppo_optimizer(model=model, actor_lr=ppo_actor_lr, critic_lr=ppo_critic_lr)
 
