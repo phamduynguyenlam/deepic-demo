@@ -3,7 +3,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -264,6 +263,20 @@ def _collect_one_icw_demo_problem_trajectory(
 
 DEFAULT_TARGET_PROBLEM = "ZDT1"
 EPDI_MC_SAMPLES = 128
+
+
+def _maybe_import_plt():
+    """Optional matplotlib import.
+
+    Some environments ship NumPy 2.x with older matplotlib wheels compiled
+    against NumPy 1.x, which crashes at import time. Keep plotting optional.
+    """
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        print(f"Warning: matplotlib is unavailable; skipping plots. ({type(exc).__name__}: {exc})")
+        return None
+    return plt
 
 
 def _consume_target_problem(default: str = DEFAULT_TARGET_PROBLEM) -> str:
@@ -1454,6 +1467,11 @@ def run_saea_icw_problem(
     true_front = multisource.nsga_eic._true_front(target_problem)
 
     if plot:
+        plt = _maybe_import_plt()
+        if plt is None:
+            plot = False
+
+    if plot:
         plt.figure(figsize=(8, 5))
         plt.title(f"{args.dim}D {target_problem} Hypervolume Comparison")
         plt.plot(hv_history, marker="o", label="SAEA-ICW")
@@ -1551,16 +1569,18 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False, mod
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
     print(f"Reference point: {icw_result['ref_point']}")
 
-    plt.figure(figsize=(8, 5))
-    plt.title(f"{args.dim}D {target_problem} Hypervolume Comparison")
-    plt.plot(icw_result["hv_history"], marker="o", label="SAEA-ICW")
-    plt.plot(moead_ego_result["hv_history"], marker="^", label="MOEAD-EGO")
-    plt.plot(eic_result["hv_history"], marker="s", label="NSGA-EIC")
-    plt.xlabel("Step")
-    plt.ylabel("Hypervolume")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
+    plt = _maybe_import_plt()
+    if plt is not None:
+        plt.figure(figsize=(8, 5))
+        plt.title(f"{args.dim}D {target_problem} Hypervolume Comparison")
+        plt.plot(icw_result["hv_history"], marker="o", label="SAEA-ICW")
+        plt.plot(moead_ego_result["hv_history"], marker="^", label="MOEAD-EGO")
+        plt.plot(eic_result["hv_history"], marker="s", label="NSGA-EIC")
+        plt.xlabel("Step")
+        plt.ylabel("Hypervolume")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
 
     multisource.nsga_eic._plot_front_comparison(
         f"{args.dim}D {target_problem} Pareto Front Comparison",
