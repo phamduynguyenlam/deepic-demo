@@ -7,6 +7,14 @@ import numpy as np
 import demo
 import multisource_eva_common as multisource
 
+try:
+    from scipy.special import erf as _erf  # type: ignore
+except Exception:  # pragma: no cover
+    from math import erf as _scalar_erf
+
+    def _erf(x):  # type: ignore
+        return np.vectorize(_scalar_erf, otypes=[np.float32])(x)
+
 
 def _tchebycheff(values: np.ndarray, weights: np.ndarray, z: np.ndarray) -> np.ndarray:
     """Tchebycheff scalarization for minimization."""
@@ -24,7 +32,7 @@ def _ei(mu: np.ndarray, sigma: np.ndarray, best: float, eps: float = 1e-12) -> n
     z = (best - mu) / sigma
     # Standard normal pdf/cdf (no scipy dependency)
     pdf = np.exp(-0.5 * z * z) / np.sqrt(2.0 * np.pi)
-    cdf = 0.5 * (1.0 + np.erf(z / np.sqrt(2.0)))
+    cdf = 0.5 * (1.0 + _erf(z / np.sqrt(2.0)))
     return (best - mu) * cdf + sigma * pdf
 
 
@@ -143,4 +151,3 @@ def run_moead_ego_problem(
         "hv_history": hv_history,
         "ref_point": ref_point,
     }
-
