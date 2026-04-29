@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import demo
 import multisource_eva_common as multisource
 import deepic_demo as deepic_eval
+from agent.deepic_agent import SimplifiedDeepIC
 
 
 DEFAULT_TARGET_PROBLEM = "ZDT1"
@@ -46,29 +47,27 @@ def _problem_slug(problem_name: str) -> str:
 
 def _epoch_checkpoint_path(problem_name: str, epoch_number: int) -> Path:
     root = Path(__file__).resolve().parent
-    return root / f"deepic_{_problem_slug(problem_name)}_centralized_ppo_epoch_{epoch_number}.pth"
+    return root / f"simp_deepic_{_problem_slug(problem_name)}_centralized_ppo_epoch_{epoch_number}.pth"
 
 
 def _final_model_path(problem_name: str) -> Path:
     root = Path(__file__).resolve().parent
-    return root / f"deepic_{_problem_slug(problem_name)}_centralized_ppo.pth"
+    return root / f"simp_deepic_{_problem_slug(problem_name)}_centralized_ppo.pth"
 
 
 def _reward_log_path(problem_name: str) -> Path:
-    return multisource.REWARD_LOG_DIR / f"deepic_{_problem_slug(problem_name)}_centralized_ppo_train_rewards.json"
+    return multisource.REWARD_LOG_DIR / f"simp_deepic_{_problem_slug(problem_name)}_centralized_ppo_train_rewards.json"
 
 
 def _best_reward_model_path(problem_name: str) -> Path:
     root = Path(__file__).resolve().parent
-    return root / f"deepic_{_problem_slug(problem_name)}_centralized_ppo_best_raw_reward.pth"
+    return root / f"simp_deepic_{_problem_slug(problem_name)}_centralized_ppo_best_raw_reward.pth"
 
 
 def _build_deepic(args):
-    return demo.DeepICClass(
-        hidden_dim=args.deepic_hidden,
-        n_heads=args.deepic_heads,
-        ff_dim=args.deepic_ff,
-    ).to(args.device)
+    return SimplifiedDeepIC(hidden_dim=args.deepic_hidden, n_heads=args.deepic_heads, ff_dim=args.deepic_ff).to(
+        args.device
+    )
 
 
 def _centralized_train_problems(target_problem: str) -> list[str]:
@@ -787,7 +786,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
     parallel_workers = max(1, min(parallel_workers, 12, len(train_envs)))
 
     print(
-        f"Training config (DeepIC Centralized PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | "
+        f"Training config (Simp-DeepIC Centralized PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | "
         f"discount={args.discount:.4f} | ppo_epochs={ppo_epochs} | ppo_clip_eps={ppo_clip_eps:.3f} | "
         f"actor_lr={ppo_actor_lr:.1e} | critic_lr={ppo_critic_lr:.1e} | vf_coef={ppo_value_coef:.3f} | "
         f"target_kl={ppo_target_kl:.4f} | adv_clip={ppo_adv_clip:.2f} | "
@@ -972,21 +971,21 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
         if (epoch + 1) % 5 == 0:
             multisource.save_colab_model_checkpoint(
                 model.state_dict(),
-                f"deepic_{_problem_slug(target_problem)}_centralized_ppo_epoch_{epoch + 1}.pth",
+                f"simp_deepic_{_problem_slug(target_problem)}_centralized_ppo_epoch_{epoch + 1}.pth",
             )
 
     torch.save(model.state_dict(), model_path)
-    print(f"DeepIC model saved to {model_path.name}")
+    print(f"SimplifiedDeepIC model saved to {model_path.name}")
     multisource._save_reward_log(
         reward_log_path,
         {
-            "script": "deepic_eva.py",
-            "mode": "train_deepic_centralized_ppo",
+            "script": "simp_deepic_eva.py",
+            "mode": "train_simp_deepic_centralized_ppo",
             "heldout_target_problem": target_problem,
             "model_path": str(model_path),
             "training_problems": train_problems,
             "train_dims": train_dims,
-            "training_label": "deepic_centralized_ppo_holdout",
+            "training_label": "simp_deepic_centralized_ppo_holdout",
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": multisource._surrogate_model_name(args),
             "best_reward_model_path": str(best_reward_model_path),

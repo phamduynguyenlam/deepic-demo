@@ -325,7 +325,8 @@ def _compute_reward(
             d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
             reward += d_i / max(d_ref_i, 1e-12)
 
-        return float(1.0 + 5.0 * reward)
+        # Scale the distance-based improvement term.
+        return float(1.0 + 10.0 * reward)
 
     if int(reward_scheme) == 2:
         previous_front = demo.DeepICClass.pareto_front(np.asarray(previous_front, dtype=np.float32))

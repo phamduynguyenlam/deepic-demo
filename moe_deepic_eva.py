@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import demo
 import multisource_eva_common as multisource
 import deepic_demo as deepic_eval
+from agent.moe_deepic_agent import MoE_SimplifiedDeepIC, moe_ppo_loss
 
 
 DEFAULT_TARGET_PROBLEM = "ZDT1"
@@ -46,28 +47,31 @@ def _problem_slug(problem_name: str) -> str:
 
 def _epoch_checkpoint_path(problem_name: str, epoch_number: int) -> Path:
     root = Path(__file__).resolve().parent
-    return root / f"deepic_{_problem_slug(problem_name)}_centralized_ppo_epoch_{epoch_number}.pth"
+    return root / f"moe_deepic_{_problem_slug(problem_name)}_centralized_ppo_epoch_{epoch_number}.pth"
 
 
 def _final_model_path(problem_name: str) -> Path:
     root = Path(__file__).resolve().parent
-    return root / f"deepic_{_problem_slug(problem_name)}_centralized_ppo.pth"
+    return root / f"moe_deepic_{_problem_slug(problem_name)}_centralized_ppo.pth"
 
 
 def _reward_log_path(problem_name: str) -> Path:
-    return multisource.REWARD_LOG_DIR / f"deepic_{_problem_slug(problem_name)}_centralized_ppo_train_rewards.json"
+    return multisource.REWARD_LOG_DIR / f"moe_deepic_{_problem_slug(problem_name)}_centralized_ppo_train_rewards.json"
 
 
 def _best_reward_model_path(problem_name: str) -> Path:
     root = Path(__file__).resolve().parent
-    return root / f"deepic_{_problem_slug(problem_name)}_centralized_ppo_best_raw_reward.pth"
+    return root / f"moe_deepic_{_problem_slug(problem_name)}_centralized_ppo_best_raw_reward.pth"
 
 
 def _build_deepic(args):
-    return demo.DeepICClass(
+    return MoE_SimplifiedDeepIC(
         hidden_dim=args.deepic_hidden,
         n_heads=args.deepic_heads,
         ff_dim=args.deepic_ff,
+        dropout=float(getattr(args, "deepic_dropout", 0.0)),
+        n_experts=int(getattr(args, "moe_experts", 4)),
+        temperature=float(getattr(args, "moe_temperature", 1.0)),
     ).to(args.device)
 
 
@@ -388,52 +392,22 @@ def _normalize_epoch_rewards_by_problem(
     return reward_stats
 
 
-def _deepic_ppo_loss(
-    agent,
+def _moe_ppo_loss(
+    agent: MoE_SimplifiedDeepIC,
     batch: dict[str, torch.Tensor],
     clip_eps: float,
     value_coef: float,
     entropy_coef: float,
+    balance_coef: float,
 ) -> dict[str, torch.Tensor]:
-    eval_out = agent.evaluate_actions(
-        H_surr=batch["H_surr"],
-        H_true=batch["H_true"],
-        progress=batch["progress"],
-        actions=batch["actions"],
+    return moe_ppo_loss(
+        agent=agent,
+        batch=batch,
+        clip_eps=float(clip_eps),
+        value_coef=float(value_coef),
+        entropy_coef=float(entropy_coef),
+        balance_coef=float(balance_coef),
     )
-
-    new_logprob = eval_out["logprob"]
-    entropy = eval_out["entropy"]
-    value = eval_out["value"]
-    old_logprob = batch["old_logprob"]
-    advantages = batch["advantages"]
-    returns = batch["returns"]
-
-    ratio = torch.exp(new_logprob - old_logprob)
-    clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_eps), 1.0 + float(clip_eps))
-    surrogate_1 = ratio * advantages
-    surrogate_2 = clipped_ratio * advantages
-    actor_loss = -torch.mean(torch.minimum(surrogate_1, surrogate_2))
-    critic_loss = F.mse_loss(value, returns)
-    entropy_loss = -torch.mean(entropy)
-    total_loss = actor_loss + float(value_coef) * critic_loss + float(entropy_coef) * entropy_loss
-    approx_kl = torch.mean(old_logprob - new_logprob)
-
-    return {
-        "total_loss": total_loss,
-        "actor_loss": actor_loss,
-        "critic_loss": critic_loss,
-        "entropy_loss": entropy_loss,
-        "approx_kl": approx_kl,
-        "ratio_mean": torch.mean(ratio),
-        "ratio_std": (
-            torch.std(ratio, unbiased=False)
-            if ratio.numel() > 1
-            else torch.zeros((), device=ratio.device, dtype=ratio.dtype)
-        ),
-        "ratio_min": torch.min(ratio),
-        "ratio_max": torch.max(ratio),
-    }
 
 
 def _shape_group_key(sample: dict) -> tuple:
@@ -465,6 +439,8 @@ def _merge_loss_stats_weighted(group_stats: list[dict[str, float]]) -> dict[str,
             "actor_loss": 0.0,
             "critic_loss": 0.0,
             "entropy_loss": 0.0,
+            "balance_loss": 0.0,
+            "gate_entropy": 0.0,
             "approx_kl": 0.0,
             "ratio_mean": 0.0,
             "ratio_std": 0.0,
@@ -489,6 +465,8 @@ def _merge_loss_stats_weighted(group_stats: list[dict[str, float]]) -> dict[str,
         "actor_loss",
         "critic_loss",
         "entropy_loss",
+        "balance_loss",
+        "gate_entropy",
         "approx_kl",
         "ratio_mean",
         "ratio_std",
@@ -519,6 +497,7 @@ def _update_deepic_from_episode_ppo(
     clip_eps: float,
     value_coef: float,
     entropy_coef: float,
+    balance_coef: float,
     grad_clip: float | None,
     target_kl: float | None,
     adv_clip: float | None,
@@ -529,6 +508,8 @@ def _update_deepic_from_episode_ppo(
             "actor_loss": 0.0,
             "critic_loss": 0.0,
             "entropy_loss": 0.0,
+            "balance_loss": 0.0,
+            "gate_entropy": 0.0,
             "approx_kl": 0.0,
             "ratio_mean": 0.0,
             "ratio_std": 0.0,
@@ -604,6 +585,8 @@ def _update_deepic_from_episode_ppo(
         "actor_loss": 0.0,
         "critic_loss": 0.0,
         "entropy_loss": 0.0,
+        "balance_loss": 0.0,
+        "gate_entropy": 0.0,
         "approx_kl": 0.0,
         "ratio_mean": 0.0,
         "ratio_std": 0.0,
@@ -646,12 +629,13 @@ def _update_deepic_from_episode_ppo(
                 "advantages": advantages[mb_idx],
                 "returns": returns[mb_idx],
             }
-            loss_dict = _deepic_ppo_loss(
+            loss_dict = _moe_ppo_loss(
                 agent=model,
                 batch=batch,
                 clip_eps=clip_eps,
                 value_coef=value_coef,
                 entropy_coef=entropy_coef,
+                balance_coef=balance_coef,
             )
             optimizer.zero_grad()
             loss_dict["total_loss"].backward()
@@ -664,6 +648,10 @@ def _update_deepic_from_episode_ppo(
             stats["actor_loss"] += float(loss_dict["actor_loss"].detach().cpu())
             stats["critic_loss"] += float(loss_dict["critic_loss"].detach().cpu())
             stats["entropy_loss"] += float(loss_dict["entropy_loss"].detach().cpu())
+            if "balance_loss" in loss_dict:
+                stats["balance_loss"] += float(loss_dict["balance_loss"].detach().cpu())
+            if "gate_entropy" in loss_dict:
+                stats["gate_entropy"] += float(loss_dict["gate_entropy"].detach().cpu())
             stats["approx_kl"] += float(loss_dict["approx_kl"].detach().cpu())
             stats["ratio_mean"] += float(loss_dict["ratio_mean"].detach().cpu())
             stats["ratio_std"] += float(loss_dict["ratio_std"].detach().cpu())
@@ -689,6 +677,8 @@ def _update_deepic_from_episode_ppo(
             "actor_loss",
             "critic_loss",
             "entropy_loss",
+            "balance_loss",
+            "gate_entropy",
             "approx_kl",
             "ratio_mean",
             "ratio_std",
@@ -714,6 +704,7 @@ def _update_deepic_from_centralized_ppo_groups(
     clip_eps: float,
     value_coef: float,
     entropy_coef: float,
+    balance_coef: float,
     grad_clip: float | None,
     target_kl: float | None,
     adv_clip: float | None,
@@ -732,6 +723,7 @@ def _update_deepic_from_centralized_ppo_groups(
             clip_eps=clip_eps,
             value_coef=value_coef,
             entropy_coef=entropy_coef,
+            balance_coef=balance_coef,
             grad_clip=grad_clip,
             target_kl=target_kl,
             adv_clip=adv_clip,
@@ -741,7 +733,7 @@ def _update_deepic_from_centralized_ppo_groups(
 
 
 def train_deepic_centralized_ppo(args, target_problem: str) -> object:
-    """Centralized PPO for DeepIC (holdout training).
+    """Centralized PPO for MoE-DeepIC (holdout training).
 
     Hold out target_problem. Train on the remaining 8 benchmark problems and
     three dimensions [15, 20, 25], i.e. 24 environments per epoch. Rollouts are
@@ -787,7 +779,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
     parallel_workers = max(1, min(parallel_workers, 12, len(train_envs)))
 
     print(
-        f"Training config (DeepIC Centralized PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | "
+        f"Training config (MoE-DeepIC Centralized PPO) | surrogate_nsga_steps={args.surrogate_nsga_steps} | "
         f"discount={args.discount:.4f} | ppo_epochs={ppo_epochs} | ppo_clip_eps={ppo_clip_eps:.3f} | "
         f"actor_lr={ppo_actor_lr:.1e} | critic_lr={ppo_critic_lr:.1e} | vf_coef={ppo_value_coef:.3f} | "
         f"target_kl={ppo_target_kl:.4f} | adv_clip={ppo_adv_clip:.2f} | "
@@ -932,6 +924,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
                 clip_eps=ppo_clip_eps,
                 value_coef=ppo_value_coef,
                 entropy_coef=ppo_entropy_coef,
+                balance_coef=float(getattr(args, "moe_balance_coef", 0.001)),
                 grad_clip=ppo_grad_clip,
                 target_kl=ppo_target_kl,
                 adv_clip=ppo_adv_clip,
@@ -944,6 +937,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
                 f"shape_groups={len(group_sizes)} | group_sizes={compact_groups} | "
                 f"total_loss={loss_stats['total_loss']:.6f}, actor={loss_stats['actor_loss']:.6f}, "
                 f"critic={loss_stats['critic_loss']:.6f}, entropy={loss_stats['entropy_loss']:.6f}, "
+                f"balance={loss_stats.get('balance_loss', 0.0):.6f}, gate_ent={loss_stats.get('gate_entropy', 0.0):.6f}, "
                 f"approx_kl={loss_stats['approx_kl']:.6f}, ratio_mean={loss_stats['ratio_mean']:.6f}, "
                 f"ratio_std={loss_stats['ratio_std']:.6f}, ratio_min={loss_stats['ratio_min']:.6f}, "
                 f"ratio_max={loss_stats['ratio_max']:.6f}, adv_mean={loss_stats['adv_mean']:.6f}, "
@@ -972,21 +966,21 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
         if (epoch + 1) % 5 == 0:
             multisource.save_colab_model_checkpoint(
                 model.state_dict(),
-                f"deepic_{_problem_slug(target_problem)}_centralized_ppo_epoch_{epoch + 1}.pth",
+                f"moe_deepic_{_problem_slug(target_problem)}_centralized_ppo_epoch_{epoch + 1}.pth",
             )
 
     torch.save(model.state_dict(), model_path)
-    print(f"DeepIC model saved to {model_path.name}")
+    print(f"MoE-DeepIC model saved to {model_path.name}")
     multisource._save_reward_log(
         reward_log_path,
         {
-            "script": "deepic_eva.py",
-            "mode": "train_deepic_centralized_ppo",
+            "script": "moe_deepic_eva.py",
+            "mode": "train_moe_deepic_centralized_ppo",
             "heldout_target_problem": target_problem,
             "model_path": str(model_path),
             "training_problems": train_problems,
             "train_dims": train_dims,
-            "training_label": "deepic_centralized_ppo_holdout",
+            "training_label": "moe_deepic_centralized_ppo_holdout",
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": multisource._surrogate_model_name(args),
             "best_reward_model_path": str(best_reward_model_path),
@@ -1003,6 +997,9 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
             "ppo_clip_eps": ppo_clip_eps,
             "ppo_value_coef": ppo_value_coef,
             "ppo_entropy_coef": ppo_entropy_coef,
+            "moe_experts": int(getattr(args, "moe_experts", 4)),
+            "moe_temperature": float(getattr(args, "moe_temperature", 1.0)),
+            "moe_balance_coef": float(getattr(args, "moe_balance_coef", 0.001)),
             "ppo_gae_lambda": ppo_gae_lambda,
             "ppo_grad_clip": ppo_grad_clip,
             "ppo_target_kl": ppo_target_kl,
@@ -1035,9 +1032,9 @@ def load_or_train_deepic(args, target_problem: str):
         try:
             model.load_state_dict(multisource._torch_load(candidate_path, args.device))
         except RuntimeError as exc:
-            print(f"Skipping incompatible DeepIC checkpoint {candidate_path.name}: {exc}")
+            print(f"Skipping incompatible MoE-DeepIC checkpoint {candidate_path.name}: {exc}")
             continue
-        print(f"Using saved DeepIC model from {candidate_path.name}")
+        print(f"Using saved MoE-DeepIC model from {candidate_path.name}")
         return model
 
     return train_deepic_centralized_ppo(args, target_problem)
@@ -1070,13 +1067,13 @@ def run_comparison(args, target_problem: str) -> None:
         initial_archive_x=shared_init_x,
     )
 
-    print(f"\nSAEA-DeepIC final HV: {deepic_result['hv_history'][-1]:.6f}")
+    print(f"\nSAEA-MoE-DeepIC final HV: {deepic_result['hv_history'][-1]:.6f}")
     print(f"NSGA-EIC final HV: {eic_result['hv_history'][-1]:.6f}")
     print(f"Reference point: {deepic_result['ref_point']}")
 
     plt.figure(figsize=(8, 5))
     plt.title(f"{args.dim}D {target_problem} Hypervolume Comparison")
-    plt.plot(deepic_result["hv_history"], marker="o", label="SAEA-DeepIC")
+    plt.plot(deepic_result["hv_history"], marker="o", label="SAEA-MoE-DeepIC")
     plt.plot(eic_result["hv_history"], marker="s", label="NSGA-EIC")
     plt.xlabel("Step")
     plt.ylabel("Hypervolume")
@@ -1087,7 +1084,7 @@ def run_comparison(args, target_problem: str) -> None:
     multisource.nsga_eic._plot_front_comparison(
         f"{args.dim}D {target_problem} Pareto Front Comparison",
         deepic_result["final_front"],
-        "SAEA-DeepIC",
+        "SAEA-MoE-DeepIC",
         eic_result["final_front"],
         "NSGA-EIC",
         deepic_result["true_front"],

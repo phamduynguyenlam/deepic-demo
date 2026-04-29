@@ -151,7 +151,7 @@ ALL_BBO_PROBLEMS = [
     "ZDT1", "ZDT2", "ZDT3",
     "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTLZ6", "DTLZ7",
 ]
-CENTRALIZED_TRAIN_DIMS = [15, 20]
+CENTRALIZED_TRAIN_DIMS = [15, 20, 25]
 
 
 def _centralized_train_problems(target_problem: str) -> list[str]:
@@ -822,7 +822,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     """Centralized PPO for ICW.
 
     Hold out target_problem. Train on the remaining 8 benchmark problems and
-    two dimensions [15, 20], i.e. 16 environments per epoch. Rollouts are
+    three dimensions [15, 20, 25], i.e. 24 environments per epoch. Rollouts are
     collected with the same frozen policy, then grouped by tensor shape for PPO
     updates. This keeps PPO on-policy while avoiding single-sample groups.
     """
@@ -843,12 +843,12 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
     # Centralized PPO hyperparameters (ICW-EVA).
     args.discount = 1.0
     ppo_epochs = 4
-    ppo_clip_eps = 0.08
-    ppo_actor_lr = 1e-4
+    ppo_clip_eps = 0.06
+    ppo_actor_lr = 7e-5
     ppo_critic_lr = 5e-5
     ppo_value_coef = 0.03
     ppo_target_kl = 0.01
-    ppo_entropy_coef = 0.01
+    ppo_entropy_coef = 0.015
     ppo_adv_clip = 2.0
 
     ppo_weight_kl_coef = float(getattr(args, "icw_weight_kl_coef", 0.01))
