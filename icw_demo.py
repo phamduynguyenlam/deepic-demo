@@ -1181,6 +1181,9 @@ def _parse_args(target_problem: str):
     args = multisource.parse_args(target_problem)
     if "--train_algo" not in sys.argv[1:]:
         args.train_algo = "ppo"
+    # Use a stronger surrogate inner loop by default for this demo script.
+    if "--surrogate_nsga_steps" not in sys.argv[1:]:
+        args.surrogate_nsga_steps = 100
     return args
 
 
