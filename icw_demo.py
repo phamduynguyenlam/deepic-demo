@@ -17,6 +17,251 @@ import deepic_demo as base_demo
 import moead_ego as moead_ego_baseline
 
 
+def _cpu_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in state_dict.items()}
+
+
+def _collect_one_icw_demo_problem_trajectory(
+    args,
+    model_state_dict: dict[str, torch.Tensor],
+    problem_name: str,
+    dim: int,
+    epoch: int,
+    ppo_gae_lambda: float,
+) -> tuple[list[dict], list[float], list[dict], dict]:
+    """Collect one on-policy trajectory for one (problem, dim) in a worker process."""
+    torch.set_num_threads(1)
+
+    worker_args = args
+    worker_args.device = "cpu" if str(getattr(args, "device", "cpu")).startswith("cuda") else args.device
+
+    model = _build_icw(worker_args)
+    model.load_state_dict(model_state_dict)
+    model.eval()
+
+    surrogate_mode = str(multisource._surrogate_model_name(worker_args)).lower()
+    kan_surrogates = None
+    if surrogate_mode in {"knn", "kan"}:
+        entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, worker_args)
+        problem = entry["problem"]
+        kan_surrogates = entry["models"]
+    else:
+        problem = multisource.nda.ZDTProblem(name=problem_name, dim=dim)
+
+    archive_x = multisource.latin_hypercube_sample(
+        lower=problem.lower,
+        upper=problem.upper,
+        n_samples=worker_args.archive_size,
+        dim=dim,
+        seed=worker_args.seed + epoch * 10000 + multisource._stable_seed(0, problem_name, dim),
+    )
+    archive_y = problem.evaluate(archive_x)
+
+    uncertainty_x = uncertainty_y = None
+    gp_surrogates = None
+    tabpfn_surrogate = None
+    if surrogate_mode == "gp":
+        gp_surrogates = demo.fit_gp_surrogates(
+            archive_x=archive_x,
+            archive_y=archive_y,
+            seed=worker_args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim),
+        )
+    elif surrogate_mode == "tabpfn":
+        from tabpfn_surrogate import TabPFNMinMaxSurrogate
+
+        tabpfn_surrogate = TabPFNMinMaxSurrogate(
+            n_objectives=int(archive_y.shape[1]),
+            tabpfn_device="cpu",
+        ).fit(archive_x, archive_y)
+    else:
+        uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
+
+    episode_trajectory: list[dict] = []
+    rewards: list[float] = []
+    records: list[dict] = []
+
+    true_evals = int(worker_args.archive_size)
+    remaining_budget = int(worker_args.max_fe) - true_evals
+    steps_to_run = remaining_budget // int(worker_args.k_eval)
+
+    for step in range(int(steps_to_run)):
+        archive_x_t = archive_x.copy()
+        archive_y_t = archive_y.copy()
+
+        if surrogate_mode == "gp":
+            if gp_surrogates is None:
+                raise ValueError("GP surrogate requested but gp_surrogates is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=archive_x_t,
+                problem=problem,
+                surrogates=gp_surrogates,
+                device=worker_args.device,
+                n_offspring=worker_args.offspring_size,
+                sigma=worker_args.mutation_sigma,
+                surrogate_nsga_steps=worker_args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_gp_mean,
+                generate_fn=demo.generate_offspring,
+            )
+            offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
+        elif surrogate_mode == "tabpfn":
+            if tabpfn_surrogate is None:
+                raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=archive_x_t,
+                problem=problem,
+                surrogates=tabpfn_surrogate,
+                device=worker_args.device,
+                n_offspring=worker_args.offspring_size,
+                sigma=worker_args.mutation_sigma,
+                surrogate_nsga_steps=worker_args.surrogate_nsga_steps,
+                predict_fn=lambda s, x, device: s.predict(x),
+                generate_fn=demo.generate_offspring,
+            )
+            offspring_sigma = tabpfn_surrogate.predict_std(offspring_x).astype(np.float32)
+        else:
+            if kan_surrogates is None:
+                raise ValueError("KAN/KNN surrogate requested but kan_surrogates is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=archive_x_t,
+                problem=problem,
+                surrogates=kan_surrogates,
+                device=worker_args.device,
+                n_offspring=worker_args.offspring_size,
+                sigma=worker_args.mutation_sigma,
+                surrogate_nsga_steps=worker_args.surrogate_nsga_steps,
+                predict_fn=demo.predict_with_kan,
+                generate_fn=demo.generate_offspring,
+            )
+            archive_pred = demo.predict_with_kan(kan_surrogates, uncertainty_x, worker_args.device).astype(np.float32)
+            offspring_sigma = demo.estimate_uncertainty(
+                archive_x=uncertainty_x,
+                archive_y=uncertainty_y,
+                archive_pred=archive_pred,
+                offspring_x=offspring_x,
+            ).astype(np.float32)
+
+        progress = float(true_evals / worker_args.max_fe)
+        model_archive_x_t, model_archive_y_t = _subsample_archive_for_model(
+            archive_x=archive_x_t,
+            archive_y=archive_y_t,
+            n_keep=int(worker_args.archive_size),
+        )
+        with torch.no_grad():
+            act_out = model.act(
+                x_true=torch.as_tensor(model_archive_x_t, dtype=torch.float32, device=worker_args.device),
+                y_true=torch.as_tensor(model_archive_y_t, dtype=torch.float32, device=worker_args.device),
+                x_sur=torch.as_tensor(offspring_x, dtype=torch.float32, device=worker_args.device),
+                y_sur=torch.as_tensor(offspring_pred, dtype=torch.float32, device=worker_args.device),
+                sigma_sur=torch.as_tensor(offspring_sigma, dtype=torch.float32, device=worker_args.device),
+                progress=progress,
+                lower_bound=problem.lower,
+                upper_bound=problem.upper,
+                deterministic=False,
+            )
+
+        current_value = float(act_out["value"][0].detach().cpu())
+        if episode_trajectory:
+            episode_trajectory[-1]["next_value"] = current_value
+            episode_trajectory[-1]["done"] = 0.0
+
+        selected_idx, _, _ = select_indices_from_action(  # type: ignore
+            action=act_out["action_weights"][0],
+            archive_y=archive_y_t,
+            offspring_pred=offspring_pred,
+            offspring_sigma=offspring_sigma,
+            k_eval=worker_args.k_eval,
+            seed=_criterion_seed(worker_args.seed, epoch, step, problem_name, dim),
+            epdi_mc_samples=EPDI_MC_SAMPLES,
+        )
+        selected_x = offspring_x[selected_idx]
+        selected_y = problem.evaluate(selected_x)
+
+        reward_value = float(
+            multisource._compute_reward(
+                previous_front=archive_y_t,
+                selected_objectives=selected_y,
+                reward_scheme=int(getattr(worker_args, "reward_scheme", 1)),
+                problem_name=problem_name,
+                dim=dim,
+            )
+        )
+        rewards.append(reward_value)
+        records.append(
+            {
+                "epoch": epoch + 1,
+                "problem": problem_name,
+                "dim": int(dim),
+                "step": step + 1,
+                "progress": float(progress),
+                "reward": reward_value,
+                "train_algo": "ppo",
+            }
+        )
+
+        episode_trajectory.append(
+            {
+                "archive_x": model_archive_x_t,
+                "archive_y": model_archive_y_t,
+                "offspring_x": offspring_x,
+                "offspring_pred": offspring_pred,
+                "offspring_sigma": offspring_sigma,
+                "progress": float(progress),
+                "lower": problem.lower,
+                "upper": problem.upper,
+                "action": act_out["action"][0].detach().cpu().numpy().astype(np.float32, copy=False),
+                "action_weights": act_out["action_weights"][0].detach().cpu().numpy().astype(np.float32, copy=False),
+                "old_logprob": float(act_out["logprob"][0].detach().cpu()),
+                "value": current_value,
+                "next_value": 0.0,
+                "done": 1.0,
+                "reward": reward_value,
+            }
+        )
+
+        archive_x, archive_y = demo.update_archive(
+            archive_x=archive_x_t,
+            archive_y=archive_y_t,
+            new_x=selected_x,
+            new_y=selected_y,
+        )
+        if surrogate_mode == "gp":
+            gp_surrogates = demo.fit_gp_surrogates(
+                archive_x=archive_x,
+                archive_y=archive_y,
+                seed=worker_args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim) + step + 1,
+            )
+        elif surrogate_mode == "tabpfn":
+            if tabpfn_surrogate is None:
+                raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+            tabpfn_surrogate.fit(archive_x, archive_y)
+        else:
+            uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
+                uncertainty_x=uncertainty_x,
+                uncertainty_y=uncertainty_y,
+                new_x=selected_x,
+                new_y=selected_y,
+            )
+
+        true_evals += int(selected_x.shape[0])
+        if true_evals >= int(worker_args.max_fe):
+            break
+
+    multisource._attach_ppo_targets(
+        episode_trajectory,
+        discount=float(worker_args.discount),
+        gae_lambda=float(ppo_gae_lambda),
+    )
+    summary = {
+        "problem": problem_name,
+        "dim": int(dim),
+        "true_evals": int(true_evals),
+        "steps": int(len(episode_trajectory)),
+        "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+        "best_obj1": float(np.min(archive_y[:, 0])) if archive_y.size else 0.0,
+    }
+    return episode_trajectory, rewards, records, summary
+
+
 DEFAULT_TARGET_PROBLEM = "ZDT1"
 EPDI_MC_SAMPLES = 128
 
@@ -495,6 +740,54 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     n_rollouts=int(getattr(args, "ppo_rollout_problems", 3)),
                     seed=args.seed + epoch * 10000 + multisource._stable_seed(113, target_problem, dim),
                 )
+
+            use_ray = bool(getattr(args, "use_ray", False))
+            ray_workers = int(getattr(args, "ray_workers", 3))
+
+            if use_ray and len(rollout_problems) > 1:
+                import copy
+                try:
+                    import ray  # type: ignore
+                except ImportError:
+                    ray = None
+
+                if ray is None:
+                    print("Warning: --ray requested but ray is not installed; falling back to sequential rollouts.")
+                else:
+                    rollout_state = _cpu_state_dict(model.state_dict())
+                    worker_args = copy.copy(args)
+                    worker_args.device = "cpu"
+                    if not ray.is_initialized():
+                        ray.init(
+                            num_cpus=ray_workers,
+                            include_dashboard=False,
+                            ignore_reinit_error=True,
+                            log_to_driver=False,
+                        )
+                    remote_collect = ray.remote(num_cpus=1)(_collect_one_icw_demo_problem_trajectory)
+                    args_ref = ray.put(worker_args)
+                    state_ref = ray.put(rollout_state)
+                    pending = [
+                        remote_collect.remote(args_ref, state_ref, p, int(dim), int(epoch), float(ppo_gae_lambda))
+                        for p in rollout_problems
+                    ]
+                    while pending:
+                        ready, pending = ray.wait(pending, num_returns=1)
+                        traj, rewards, records, summary = ray.get(ready[0])
+                        dim_trajectories.extend(traj)
+                        epoch_rewards.extend([float(r) for r in rewards])
+                        reward_records.extend(records)
+                        dim_problem_count += 1
+                        print(
+                            f"{summary['problem']}-{summary['dim']}D epoch {epoch + 1} done, "
+                            f"true_evals={summary['true_evals']}, best_obj1={summary['best_obj1']:.6f}"
+                        )
+
+                    dim_rollout_buffers[int(dim)] = {
+                        "trajectories": dim_trajectories,
+                        "problem_count": dim_problem_count,
+                    }
+                    continue
 
             for problem_name in rollout_problems:
                 surrogate_mode = str(multisource._surrogate_model_name(args)).lower()
@@ -1187,16 +1480,24 @@ def _parse_args(target_problem: str):
     return args
 
 
-def _extract_infer_cli_args(argv: list[str]) -> tuple[list[str], bool]:
+def _extract_infer_cli_args(argv: list[str]) -> tuple[list[str], bool, bool, int]:
     """Extract custom inference-only flags that multisource.parse_args doesn't know about."""
     filtered: list[str] = []
     random_model = False
+    use_ray = False
+    ray_workers = 3
     for token in argv:
         if token == "--random_model":
             random_model = True
             continue
+        if token == "--ray":
+            use_ray = True
+            continue
+        if token.startswith("--ray_workers="):
+            ray_workers = int(token.split("=", 1)[1])
+            continue
         filtered.append(token)
-    return filtered, random_model
+    return filtered, random_model, use_ray, ray_workers
 
 
 def run_comparison(args, target_problem: str, self_train_only: bool = False, model: ICW | None = None) -> None:
@@ -1262,13 +1563,15 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False, mod
 
 def main():
     target_problem = _consume_target_problem()
-    filtered_argv, random_model = _extract_infer_cli_args(sys.argv[1:])
+    filtered_argv, random_model, use_ray, ray_workers = _extract_infer_cli_args(sys.argv[1:])
     original_argv = sys.argv[:]
     sys.argv = [sys.argv[0], *filtered_argv]
     try:
         args = _parse_args(target_problem)
     finally:
         sys.argv = original_argv
+    args.use_ray = bool(use_ray)
+    args.ray_workers = int(ray_workers)
     if args.dim != 30:
         print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
