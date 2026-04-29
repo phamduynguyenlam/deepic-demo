@@ -936,12 +936,15 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                         selected_std = np.asarray(offspring_sigma, dtype=np.float32)[selected_idx]
 
                     selected_y = problem.evaluate(selected_x).astype(np.float32, copy=False)
-                    abs_err = np.abs(np.asarray(selected_mean, dtype=np.float32) - np.asarray(selected_y, dtype=np.float32))
-                    print(
-                        f"[Surrogate check] {problem_name}-{dim}D step {step + 1:02d} "
-                        f"pred_mean={_format_matrix(selected_mean)}, pred_std={_format_matrix(selected_std)}, "
-                        f"true_y={_format_matrix(selected_y)}, abs_err={_format_matrix(abs_err)}"
-                    )
+                    if not bool(getattr(args, "train_only", False)):
+                        abs_err = np.abs(
+                            np.asarray(selected_mean, dtype=np.float32) - np.asarray(selected_y, dtype=np.float32)
+                        )
+                        print(
+                            f"[Surrogate check] {problem_name}-{dim}D step {step + 1:02d} "
+                            f"pred_mean={_format_matrix(selected_mean)}, pred_std={_format_matrix(selected_std)}, "
+                            f"true_y={_format_matrix(selected_y)}, abs_err={_format_matrix(abs_err)}"
+                        )
 
                     reward_value = float(
                         multisource._compute_reward(
