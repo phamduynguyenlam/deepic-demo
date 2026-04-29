@@ -768,7 +768,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
     ppo_epochs = int(getattr(args, "ppo_epochs", 4))
     ppo_clip_eps = float(getattr(args, "ppo_clip_eps", 0.08))
     ppo_actor_lr = float(getattr(args, "ppo_actor_lr", 1e-4))
-    ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 1e-4))
+    ppo_critic_lr = float(getattr(args, "ppo_critic_lr", 5e-5))
     ppo_value_coef = float(getattr(args, "ppo_value_coef", 0.03))
     ppo_entropy_coef = float(getattr(args, "ppo_entropy_coef", 0.01))
     # If not explicitly set, prefer 64 when batch is large; otherwise 32.
@@ -966,6 +966,11 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
                 f"New best mean raw reward at epoch {epoch + 1}: {raw_epoch_mean:.6f} | "
                 f"saved to {best_reward_model_path.name}"
             )
+            # Light learning-rate decay on improvements to reduce drift.
+            ppo_actor_lr *= 0.97
+            if optimizer.param_groups:
+                optimizer.param_groups[0]["lr"] = float(ppo_actor_lr)
+            print(f"Decayed actor_lr to {ppo_actor_lr:.2e}")
 
         torch.save(model.state_dict(), _epoch_checkpoint_path(target_problem, epoch + 1))
 
@@ -1111,7 +1116,7 @@ def _parse_args(target_problem: str):
     if "--ppo_actor_lr" not in sys.argv[1:]:
         args.ppo_actor_lr = 1e-4
     if "--ppo_critic_lr" not in sys.argv[1:]:
-        args.ppo_critic_lr = 1e-4
+        args.ppo_critic_lr = 5e-5
     if "--ppo_value_coef" not in sys.argv[1:]:
         args.ppo_value_coef = 0.03
     if "--ppo_target_kl" not in sys.argv[1:]:

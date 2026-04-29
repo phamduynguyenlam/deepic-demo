@@ -52,27 +52,27 @@ def _problem_slug(problem_name: str) -> str:
 def _epoch_checkpoint_path(problem_name: str, epoch_number: int, self_train_only: bool = False) -> Path:
     root = Path(__file__).resolve().parent
     if self_train_only:
-        return root / f"iwc_{_problem_slug(problem_name)}_self_model_epoch_{epoch_number}.pth"
-    return root / f"iwc_{_problem_slug(problem_name)}_model_epoch_{epoch_number}.pth"
+        return root / f"icw_{_problem_slug(problem_name)}_self_model_epoch_{epoch_number}.pth"
+    return root / f"icw_{_problem_slug(problem_name)}_model_epoch_{epoch_number}.pth"
 
 
 def _final_model_path(problem_name: str, self_train_only: bool = False) -> Path:
     root = Path(__file__).resolve().parent
     if self_train_only:
-        return root / f"iwc_{_problem_slug(problem_name)}_self_only.pth"
-    return root / f"iwc_{_problem_slug(problem_name)}_source_mix.pth"
+        return root / f"icw_{_problem_slug(problem_name)}_self_only.pth"
+    return root / f"icw_{_problem_slug(problem_name)}_source_mix.pth"
 
 
 def _reward_log_path(problem_name: str, self_train_only: bool = False) -> Path:
     label = "demo" if self_train_only else "eva"
-    return multisource.REWARD_LOG_DIR / f"iwc_{_problem_slug(problem_name)}_{label}_train_rewards.json"
+    return multisource.REWARD_LOG_DIR / f"icw_{_problem_slug(problem_name)}_{label}_train_rewards.json"
 
 
 def _best_reward_model_path(problem_name: str, self_train_only: bool = False) -> Path:
     root = Path(__file__).resolve().parent
     if self_train_only:
-        return root / f"iwc_{_problem_slug(problem_name)}_self_only_ppo_best_reward.pth"
-    return root / f"iwc_{_problem_slug(problem_name)}_source_mix_ppo_best_reward.pth"
+        return root / f"icw_{_problem_slug(problem_name)}_self_only_ppo_best_reward.pth"
+    return root / f"icw_{_problem_slug(problem_name)}_source_mix_ppo_best_reward.pth"
 
 
 def _build_icw(args) -> ICW:
@@ -89,6 +89,14 @@ def _criterion_seed(base_seed: int, epoch_idx: int, step_idx: int, problem_name:
 
 
 def _format_vector(values: np.ndarray) -> str:
+    return np.array2string(
+        np.asarray(values, dtype=np.float32),
+        precision=4,
+        separator=", ",
+        suppress_small=False,
+    )
+
+def _format_matrix(values: np.ndarray) -> str:
     return np.array2string(
         np.asarray(values, dtype=np.float32),
         precision=4,
@@ -450,7 +458,10 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
         f"rollout_problems={int(getattr(args, 'ppo_rollout_problems', 3))}"
     )
 
-    pretrain_cache = _pretrain_target_surrogates(args, target_problem)
+    surrogate_mode_global = str(multisource._surrogate_model_name(args)).lower()
+    pretrain_cache: dict = {}
+    if surrogate_mode_global in {"knn", "kan"}:
+        pretrain_cache = _pretrain_target_surrogates(args, target_problem)
     optimizer = multisource._build_ppo_optimizer(
         model=model,
         actor_lr=ppo_actor_lr,
@@ -485,12 +496,17 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                 )
 
             for problem_name in rollout_problems:
-                entry = pretrain_cache.get((problem_name, dim))
-                if entry is None:
-                    entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, args)
-                    pretrain_cache[(problem_name, dim)] = entry
-                problem = entry["problem"]
-                surrogates = entry["models"]
+                surrogate_mode = str(multisource._surrogate_model_name(args)).lower()
+                if surrogate_mode in {"knn", "kan"}:
+                    entry = pretrain_cache.get((problem_name, dim))
+                    if entry is None:
+                        entry = multisource.load_or_prepare_kan_surrogate(problem_name, dim, args)
+                        pretrain_cache[(problem_name, dim)] = entry
+                    problem = entry["problem"]
+                    surrogates = entry["models"]
+                else:
+                    problem = multisource.nda.ZDTProblem(name=problem_name, dim=dim)
+                    surrogates = None
                 episode_trajectory: list[dict] = []
 
                 archive_x = multisource.latin_hypercube_sample(
@@ -501,15 +517,23 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                     seed=args.seed + epoch * 10000 + multisource._stable_seed(0, problem_name, dim),
                 )
                 archive_y = problem.evaluate(archive_x)
-                surrogate_mode = multisource._surrogate_model_name(args)
+                surrogate_mode = str(multisource._surrogate_model_name(args)).lower()
                 uncertainty_x = uncertainty_y = None
                 gp_surrogates = None
+                tabpfn_surrogate = None
                 if surrogate_mode == "gp":
                     gp_surrogates = demo.fit_gp_surrogates(
                         archive_x=archive_x,
                         archive_y=archive_y,
                         seed=args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim),
                     )
+                elif surrogate_mode == "tabpfn":
+                    from tabpfn_surrogate import TabPFNMinMaxSurrogate
+
+                    tabpfn_surrogate = TabPFNMinMaxSurrogate(
+                        n_objectives=int(archive_y.shape[1]),
+                        tabpfn_device="cpu" if str(args.device).startswith("cuda") else str(args.device),
+                    ).fit(archive_x, archive_y)
                 else:
                     uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
 
@@ -536,7 +560,24 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                             generate_fn=demo.generate_offspring,
                         )
                         offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
+                    elif surrogate_mode == "tabpfn":
+                        if tabpfn_surrogate is None:
+                            raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+                        offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                            archive_x=archive_x_t,
+                            problem=problem,
+                            surrogates=tabpfn_surrogate,
+                            device=args.device,
+                            n_offspring=args.offspring_size,
+                            sigma=args.mutation_sigma,
+                            surrogate_nsga_steps=args.surrogate_nsga_steps,
+                            predict_fn=lambda s, x, device: s.predict(x),
+                            generate_fn=demo.generate_offspring,
+                        )
+                        offspring_sigma = tabpfn_surrogate.predict_std(offspring_x).astype(np.float32)
                     else:
+                        if surrogates is None:
+                            raise ValueError("KAN/KNN surrogate requested but surrogates is None.")
                         offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
                             archive_x=archive_x_t,
                             problem=problem,
@@ -591,6 +632,21 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                         epdi_mc_samples=EPDI_MC_SAMPLES,
                     )
                     selected_x = offspring_x[selected_idx]
+                    if surrogate_mode == "gp":
+                        selected_pred = demo.predict_with_gp_mean(gp_surrogates, selected_x)
+                        selected_std = demo.predict_with_gp_std(gp_surrogates, selected_x)
+                        selected_var = np.square(selected_std)
+                    elif surrogate_mode == "tabpfn":
+                        mean, std = tabpfn_surrogate.predict_mean_std(selected_x)
+                        selected_pred = mean
+                        selected_var = np.square(std)
+                    else:
+                        selected_pred = np.asarray(offspring_pred, dtype=np.float32)[selected_idx]
+                        selected_var = np.square(np.asarray(offspring_sigma, dtype=np.float32)[selected_idx])
+                    print(
+                        f"[Surrogate check] {problem_name}-{dim}D step {step + 1:02d} "
+                        f"selected_mean={_format_matrix(selected_pred)}, selected_var={_format_matrix(selected_var)}"
+                    )
                     selected_y = problem.evaluate(selected_x)
 
                     reward_value = float(
@@ -651,6 +707,10 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                             archive_y=archive_y,
                             seed=args.seed + epoch * 10000 + multisource._stable_seed(17, problem_name, dim) + step + 1,
                         )
+                    elif surrogate_mode == "tabpfn":
+                        if tabpfn_surrogate is None:
+                            raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+                        tabpfn_surrogate.fit(archive_x, archive_y)
                     else:
                         uncertainty_x, uncertainty_y = demo.update_uncertainty_archive(
                             uncertainty_x=uncertainty_x,
@@ -752,7 +812,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
         if (epoch + 1) % 5 == 0:
             multisource.save_colab_model_checkpoint(
                 model.state_dict(),
-                f"iwc_{_problem_slug(target_problem)}_{'self_only' if self_train_only else 'source_mix'}_ppo_epoch_{epoch + 1}.pth",
+                f"icw_{_problem_slug(target_problem)}_{'self_only' if self_train_only else 'source_mix'}_ppo_epoch_{epoch + 1}.pth",
             )
 
     torch.save(model.state_dict(), model_path)
@@ -766,7 +826,7 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
             "model_path": str(model_path),
             "training_problems": [target_problem],
             "source_dims": multisource.SOURCE_DIMS,
-            "training_label": "iwc_self_only" if self_train_only else "iwc_source_mix",
+            "training_label": "icw_self_only" if self_train_only else "icw_source_mix",
             "reward_scheme": int(getattr(args, "reward_scheme", 1)),
             "surrogate_model": multisource._surrogate_model_name(args),
             "best_reward_model_path": str(best_reward_model_path),
@@ -806,10 +866,24 @@ def load_or_train_icw(args, target_problem: str, self_train_only: bool = False) 
     if best_reward_path.exists() and best_reward_path not in candidate_paths:
         candidate_paths.append(best_reward_path)
 
+    # Backwards compatibility: older checkpoints used the "iwc_" prefix.
+    root = Path(__file__).resolve().parent
+    legacy_prefix = "iwc"
+    new_prefix = "icw"
+    legacy_model_path = Path(str(model_path).replace(f"{new_prefix}_", f"{legacy_prefix}_", 1))
+    if legacy_model_path.exists() and legacy_model_path not in candidate_paths:
+        candidate_paths.append(legacy_model_path)
+    legacy_best_path = Path(str(best_reward_path).replace(f"{new_prefix}_", f"{legacy_prefix}_", 1))
+    if legacy_best_path.exists() and legacy_best_path not in candidate_paths:
+        candidate_paths.append(legacy_best_path)
+
     for epoch_number in range(multisource.TRAIN_EPOCHS, 0, -1):
         checkpoint_path = _epoch_checkpoint_path(target_problem, epoch_number, self_train_only=self_train_only)
         if checkpoint_path.exists() and checkpoint_path not in candidate_paths:
             candidate_paths.append(checkpoint_path)
+        legacy_checkpoint_path = root / checkpoint_path.name.replace(f"{new_prefix}_", f"{legacy_prefix}_", 1)
+        if legacy_checkpoint_path.exists() and legacy_checkpoint_path not in candidate_paths:
+            candidate_paths.append(legacy_checkpoint_path)
 
     for candidate_path in candidate_paths:
         model = _build_icw(args)
@@ -839,7 +913,8 @@ def run_saea_icw_problem(
     pretrain_x = pretrain_y = None
     kan_surrogates = None
     gp_surrogates = None
-    if surrogate_mode != "gp":
+    tabpfn_surrogate = None
+    if surrogate_mode in {"knn", "kan"}:
         pretrain_entry = multisource.load_or_prepare_kan_surrogate(target_problem, args.dim, args)
         pretrain_x = pretrain_entry["x"]
         pretrain_y = pretrain_entry["y"]
@@ -867,6 +942,13 @@ def run_saea_icw_problem(
             archive_y=archive_y,
             seed=args.seed + multisource._stable_seed(89, target_problem, args.dim),
         )
+    elif surrogate_mode == "tabpfn":
+        from tabpfn_surrogate import TabPFNMinMaxSurrogate
+
+        tabpfn_surrogate = TabPFNMinMaxSurrogate(
+            n_objectives=int(archive_y.shape[1]),
+            tabpfn_device=str(getattr(args, "device", "cpu")),
+        ).fit(archive_x, archive_y)
     else:
         uncertainty_x, uncertainty_y = demo.init_uncertainty_archive(archive_x, archive_y)
 
@@ -902,6 +984,20 @@ def run_saea_icw_problem(
                 predict_fn=demo.predict_with_gp_mean,
                 generate_fn=demo.generate_offspring,
             )
+        elif surrogate_mode == "tabpfn":
+            if tabpfn_surrogate is None:
+                raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+            offspring_x, offspring_pred = multisource.nsga_eic.generate_nsga2_pseudo_front(
+                archive_x=surrogate_seed_x,
+                problem=problem,
+                surrogates=tabpfn_surrogate,
+                device=args.device,
+                n_offspring=base_demo.SURROGATE_WORKING_SIZE,
+                sigma=args.mutation_sigma,
+                surrogate_nsga_steps=args.surrogate_nsga_steps,
+                predict_fn=lambda s, x, device: s.predict(x),
+                generate_fn=demo.generate_offspring,
+            )
         else:
             if kan_surrogates is None:
                 raise ValueError("KAN surrogate requested but kan_surrogates is None.")
@@ -924,6 +1020,10 @@ def run_saea_icw_problem(
 
         if surrogate_mode == "gp":
             offspring_sigma = demo.predict_with_gp_std(gp_surrogates, offspring_x).astype(np.float32)
+        elif surrogate_mode == "tabpfn":
+            if tabpfn_surrogate is None:
+                raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+            offspring_sigma = tabpfn_surrogate.predict_std(offspring_x).astype(np.float32)
         else:
             archive_pred = demo.predict_with_kan(kan_surrogates, uncertainty_x, args.device).astype(np.float32)
             offspring_sigma = demo.estimate_uncertainty(
@@ -963,6 +1063,21 @@ def run_saea_icw_problem(
             epdi_mc_samples=EPDI_MC_SAMPLES,
         )
         selected_x = offspring_x[selected_idx]
+        if surrogate_mode == "gp":
+            selected_pred = demo.predict_with_gp_mean(gp_surrogates, selected_x)
+            selected_std = demo.predict_with_gp_std(gp_surrogates, selected_x)
+            selected_var = np.square(selected_std)
+        elif surrogate_mode == "tabpfn":
+            mean, std = tabpfn_surrogate.predict_mean_std(selected_x)
+            selected_pred = mean
+            selected_var = np.square(std)
+        else:
+            selected_pred = np.asarray(offspring_pred, dtype=np.float32)[selected_idx]
+            selected_var = np.square(np.asarray(offspring_sigma, dtype=np.float32)[selected_idx])
+        print(
+            f"[Surrogate check] {target_problem}-{args.dim}D iter {step_idx + 1:02d} "
+            f"selected_mean={_format_matrix(selected_pred)}, selected_var={_format_matrix(selected_var)}"
+        )
         selected_y = problem.evaluate(selected_x)
 
         reward_value = float(
@@ -1012,6 +1127,10 @@ def run_saea_icw_problem(
                 archive_y=archive_y,
                 seed=args.seed + 300 + step_idx,
             )
+        elif surrogate_mode == "tabpfn":
+            if tabpfn_surrogate is None:
+                raise ValueError("TabPFN surrogate requested but tabpfn_surrogate is None.")
+            tabpfn_surrogate.fit(archive_x, archive_y)
         else:
             combined_x = np.vstack([pretrain_x, archive_x])
             combined_y = np.vstack([pretrain_y, archive_y])

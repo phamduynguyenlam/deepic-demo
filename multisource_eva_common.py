@@ -1819,8 +1819,8 @@ def parse_args(target_problem: str, argv=None):
         dest="surrogate_model",
         type=str,
         default="gp",
-        choices=["gp", "knn", "kan"],
-        help="Surrogate mode: gp=use GP for surrogate predictions/uncertainty, knn=KAN preds + KNN residual uncertainty, kan=same as knn (explicit KAN).",
+        choices=["gp", "knn", "kan", "tabpfn"],
+        help="Surrogate mode: gp=use GP for surrogate predictions/uncertainty, tabpfn=TabPFN bar-distribution surrogate (refit on archive), knn=KAN preds + KNN residual uncertainty, kan=same as knn (explicit KAN).",
     )
     parser.add_argument(
         "--uncertainty_model",
