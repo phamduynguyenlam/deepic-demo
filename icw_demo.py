@@ -1028,9 +1028,17 @@ def train_icw_multisource_ppo(args, target_problem: str, self_train_only: bool =
                 dim_trajectories.extend(episode_trajectory)
                 dim_problem_count += 1
 
+                try:
+                    ref_point = multisource.nsga_eic._reference_point(problem_name, int(dim))
+                    fronts, _ = demo.fast_non_dominated_sort(archive_y)
+                    front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+                    final_hv = float(demo.hypervolume_2d(front, ref_point))
+                except Exception:
+                    final_hv = float("nan")
+
                 print(
                     f"{problem_name}-{dim}D epoch {epoch + 1} done, "
-                    f"true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0]):.6f}"
+                    f"true_evals={true_evals}, best_obj1={np.min(archive_y[:, 0]):.6f}, final_HV={final_hv:.6f}"
                 )
 
             dim_rollout_buffers[int(dim)] = {
