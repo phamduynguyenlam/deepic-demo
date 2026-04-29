@@ -1176,8 +1176,28 @@ def run_saea_icw_problem(
     }
 
 
-def run_comparison(args, target_problem: str, self_train_only: bool = False) -> None:
-    model = load_or_train_icw(args, target_problem, self_train_only=self_train_only)
+def _parse_args(target_problem: str):
+    args = multisource.parse_args(target_problem)
+    if "--train_algo" not in sys.argv[1:]:
+        args.train_algo = "ppo"
+    return args
+
+
+def _extract_infer_cli_args(argv: list[str]) -> tuple[list[str], bool]:
+    """Extract custom inference-only flags that multisource.parse_args doesn't know about."""
+    filtered: list[str] = []
+    random_model = False
+    for token in argv:
+        if token == "--random_model":
+            random_model = True
+            continue
+        filtered.append(token)
+    return filtered, random_model
+
+
+def run_comparison(args, target_problem: str, self_train_only: bool = False, model: ICW | None = None) -> None:
+    if model is None:
+        model = load_or_train_icw(args, target_problem, self_train_only=self_train_only)
     problem = multisource.nda.ZDTProblem(name=target_problem, dim=args.dim)
     shared_init_x = multisource.latin_hypercube_sample(
         lower=problem.lower,
@@ -1227,16 +1247,15 @@ def run_comparison(args, target_problem: str, self_train_only: bool = False) -> 
     )
 
 
-def _parse_args(target_problem: str):
-    args = multisource.parse_args(target_problem)
-    if "--train_algo" not in sys.argv[1:]:
-        args.train_algo = "ppo"
-    return args
-
-
 def main():
     target_problem = _consume_target_problem()
-    args = _parse_args(target_problem)
+    filtered_argv, random_model = _extract_infer_cli_args(sys.argv[1:])
+    original_argv = sys.argv[:]
+    sys.argv = [sys.argv[0], *filtered_argv]
+    try:
+        args = _parse_args(target_problem)
+    finally:
+        sys.argv = original_argv
     if args.dim != 30:
         print(f"Warning: expected 30D evaluation for {target_problem}, but received dim={args.dim}.")
 
@@ -1245,7 +1264,13 @@ def main():
             raise ValueError("icw_demo.py currently supports PPO training only.")
         train_icw_multisource_ppo(args, target_problem, self_train_only=True)
     else:
-        run_comparison(args, target_problem, self_train_only=True)
+        if random_model:
+            demo.set_seed(int(args.seed))
+            model = _build_icw(args)
+            print("Using random ICW weights (no checkpoint load).")
+            run_comparison(args, target_problem, self_train_only=True, model=model)
+        else:
+            run_comparison(args, target_problem, self_train_only=True)
 
 
 if __name__ == "__main__":
