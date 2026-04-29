@@ -336,6 +336,13 @@ def _collect_one_deepic_env_trajectory(
         "steps": int(len(trajectory)),
         "mean_reward": float(np.mean([s["reward"] for s in trajectory])) if trajectory else 0.0,
     }
+    try:
+        ref_point = multisource.nsga_eic._reference_point(problem_name, int(dim))
+        fronts, _ = demo.fast_non_dominated_sort(archive_y)
+        front = archive_y[np.asarray(fronts[0], dtype=np.int64)]
+        summary["final_hv"] = float(demo.hypervolume_2d(front, ref_point))
+    except Exception:
+        summary["final_hv"] = float("nan")
     return trajectory, reward_records, summary
 
 
@@ -842,7 +849,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
                 print(
                     f"{problem_name}-{dim}D epoch {epoch + 1} done, "
                     f"true_evals={summary['true_evals']}, best_obj1={summary['best_obj1']:.6f}, "
-                    f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}"
+                    f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}, final_HV={summary.get('final_hv', float('nan')):.6f}"
                 )
         else:
             import copy
@@ -876,7 +883,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
                         print(
                             f"{summary['problem']}-{summary['dim']}D epoch {epoch + 1} done, "
                             f"true_evals={summary['true_evals']}, best_obj1={summary['best_obj1']:.6f}, "
-                            f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}"
+                            f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}, final_HV={summary.get('final_hv', float('nan')):.6f}"
                         )
             else:
                 if not ray.is_initialized():
@@ -902,7 +909,7 @@ def train_deepic_centralized_ppo(args, target_problem: str) -> object:
                     print(
                         f"{summary['problem']}-{summary['dim']}D epoch {epoch + 1} done, "
                         f"true_evals={summary['true_evals']}, best_obj1={summary['best_obj1']:.6f}, "
-                        f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}"
+                        f"steps={summary['steps']}, mean_reward={summary['mean_reward']:.6f}, final_HV={summary.get('final_hv', float('nan')):.6f}"
                     )
 
         raw_epoch_rewards = [float(r.get("raw_reward", r["reward"])) for r in epoch_reward_records]
