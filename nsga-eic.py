@@ -172,9 +172,55 @@ def parse_args():
     parser.add_argument("--deepic_lr", type=float, default=1e-4)
     parser.add_argument("--deepic_adapt_steps", type=int, default=8)
     parser.add_argument("--surrogate_nsga_steps", type=int, default=40)
+    parser.add_argument(
+        "--surrogate_nsga_repeats",
+        type=int,
+        default=1,
+        help=(
+            "Run surrogate NSGA-II m times from the same archive per outer step, then select among the pooled "
+            "candidates (pool_size * m)."
+        ),
+    )
+    parser.add_argument(
+        "--surrogate_nsga_pool_size",
+        type=int,
+        default=0,
+        help=(
+            "Number of candidates generated per surrogate NSGA-II run. If <= 0, defaults to archive_size "
+            "(so pooled candidates ~= 80 * m with default archive_size=80)."
+        ),
+    )
+    parser.add_argument(
+        "--surrogate_nsga_parallel_repeats",
+        action="store_true",
+        help="Parallelize the m surrogate NSGA-II repeats using a thread pool (safe for non-picklable torch models).",
+    )
+    parser.add_argument(
+        "--surrogate_nsga_parallel_workers",
+        type=int,
+        default=0,
+        help="Number of worker threads for --surrogate_nsga_parallel_repeats (0 => min(m, cpu_count)).",
+    )
     parser.add_argument("--discount", type=float, default=0.99, help="Reward discount/multiplier used during RL updates")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--problem",
+        type=str,
+        default="ZDT1",
+        help="Run NSGA-EIC on a single problem (no DeepIC comparison).",
+    )
+    parser.add_argument(
+        "--all_problems",
+        action="store_true",
+        help="Run NSGA-EIC on the default 9-problem suite (no DeepIC comparison).",
+    )
+    parser.add_argument(
+        "--problems",
+        type=str,
+        default="",
+        help="Comma-separated problem list to run with NSGA-EIC only (overrides --problem).",
+    )
     parser.add_argument("--compare", action="store_true", help="Compare pre-trained DeepIC-assisted EA against NSGA-EIC on ZDT1")
     parser.add_argument("--compare_zdt2", action="store_true", help="Compare pre-trained DeepIC-assisted EA against NSGA-EIC on ZDT2")
     parser.add_argument("--compare_zdt2_only_model", action="store_true", help="Compare ZDT2-only DeepIC-assisted EA against NSGA-EIC on ZDT2")
@@ -188,6 +234,20 @@ def parse_args():
     parser.add_argument("--compare_dtlz7", action="store_true", help="Compare pre-trained DeepIC-assisted EA against NSGA-EIC on DTLZ7")
     parser.add_argument("--train_zdt2_only", action="store_true", help="Train DeepIC on ZDT2 only and save model")
     return parser.parse_args()
+
+
+def _default_nsga_eic_suite_9() -> list[str]:
+    # 9-problem suite: 2 ZDT + 7 DTLZ (no ZDT7).
+    return ["ZDT1", "ZDT2", "DTLZ1", "DTLZ2", "DTLZ3", "DTLZ4", "DTLZ5", "DTLZ6", "DTLZ7"]
+
+
+def _parse_problem_list(args) -> list[str] | None:
+    problems_raw = str(getattr(args, "problems", "")).strip()
+    if problems_raw:
+        return [p.strip() for p in problems_raw.split(",") if p.strip()]
+    if bool(getattr(args, "all_problems", False)):
+        return _default_nsga_eic_suite_9()
+    return None
 
 
 def _true_front(problem_name: str) -> np.ndarray:
@@ -368,24 +428,76 @@ def run_nsga_eic_problem(args, problem_name: str, plot: bool = True, initial_arc
 
     step = 0
     while true_evals < args.max_fe:
-        offspring_x, offspring_pred = generate_nsga2_pseudo_front(
-            archive_x=archive_x,
-            problem=problem,
-            surrogates=surrogates,
-            device=args.device,
-            n_offspring=args.offspring_size,
-            sigma=args.mutation_sigma,
-            surrogate_nsga_steps=args.surrogate_nsga_steps,
-            predict_fn=nda.predict_with_kan,
-            generate_fn=nda.generate_offspring,
-        )
+        repeats = max(int(getattr(args, "surrogate_nsga_repeats", 1)), 1)
+        pool_size = int(getattr(args, "surrogate_nsga_pool_size", 0))
+        if pool_size <= 0:
+            pool_size = int(args.archive_size)
+
+        pooled_x: list[np.ndarray] = []
+        pooled_pred: list[np.ndarray] = []
+        pooled_sigma: list[np.ndarray] = []
+
         archive_sur_pred = nda.predict_with_kan(surrogates, archive_x, args.device)
-        offspring_sigma = nda.estimate_uncertainty(
-            archive_x=archive_x,
-            archive_y=archive_y,
-            archive_pred=archive_sur_pred,
-            offspring_x=offspring_x,
-        ).astype(np.float32)
+        base_seed = int(getattr(args, "seed", 0)) + step * 10007
+
+        def _one_repeat(rep_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            rng = np.random.default_rng(base_seed + int(rep_idx) * 97)
+
+            def _generate_with_rng(
+                *,
+                archive_x: np.ndarray,
+                n_offspring: int,
+                lower: float,
+                upper: float,
+                sigma: float,
+            ) -> np.ndarray:
+                parent_idx = rng.integers(0, int(archive_x.shape[0]), size=int(n_offspring), endpoint=False)
+                parents = archive_x[np.asarray(parent_idx, dtype=np.int64)]
+                noise = rng.normal(loc=0.0, scale=float(sigma), size=parents.shape).astype(np.float32)
+                return np.clip(parents + noise, float(lower), float(upper)).astype(np.float32)
+
+            off_x, off_pred = generate_nsga2_pseudo_front(
+                archive_x=archive_x,
+                problem=problem,
+                surrogates=surrogates,
+                device=args.device,
+                n_offspring=pool_size,
+                sigma=args.mutation_sigma,
+                surrogate_nsga_steps=args.surrogate_nsga_steps,
+                predict_fn=nda.predict_with_kan,
+                generate_fn=_generate_with_rng,
+            )
+            off_sigma = nda.estimate_uncertainty(
+                archive_x=archive_x,
+                archive_y=archive_y,
+                archive_pred=archive_sur_pred,
+                offspring_x=off_x,
+            ).astype(np.float32)
+            return off_x, off_pred, off_sigma
+
+        if bool(getattr(args, "surrogate_nsga_parallel_repeats", False)) and repeats > 1:
+            import os
+            from concurrent.futures import ThreadPoolExecutor
+
+            max_workers = int(getattr(args, "surrogate_nsga_parallel_workers", 0))
+            if max_workers <= 0:
+                max_workers = min(int(repeats), int(os.cpu_count() or 1))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for off_x, off_pred, off_sigma in ex.map(_one_repeat, range(repeats)):
+                    pooled_x.append(off_x)
+                    pooled_pred.append(off_pred)
+                    pooled_sigma.append(off_sigma)
+        else:
+            for rep_idx in range(repeats):
+                off_x, off_pred, off_sigma = _one_repeat(rep_idx)
+                pooled_x.append(off_x)
+                pooled_pred.append(off_pred)
+                pooled_sigma.append(off_sigma)
+
+        offspring_x = np.vstack(pooled_x).astype(np.float32)
+        offspring_pred = np.vstack(pooled_pred).astype(np.float32)
+        offspring_sigma = np.vstack(pooled_sigma).astype(np.float32)
 
         remaining_budget = args.max_fe - true_evals
         n_select = int(min(args.k_eval, remaining_budget))
@@ -1397,6 +1509,15 @@ def run_comparison_dtlz7(args):
 
 def main():
     args = parse_args()
+    problem_list = _parse_problem_list(args)
+    if problem_list is not None:
+        results: dict[str, dict] = {}
+        for p in problem_list:
+            print(f"\n=== NSGA-EIC only | problem={p} | dim={int(args.dim)} ===")
+            results[p] = run_nsga_eic_problem(args, problem_name=p, plot=False)
+            print(f"NSGA-EIC only | {p} final HV: {float(results[p]['hv_history'][-1]):.6f}")
+        return
+
     if args.train_zdt2_only:
         train_zdt2_only(args)
     elif args.compare_dtlz7:
@@ -1422,7 +1543,7 @@ def main():
     elif args.compare:
         run_comparison(args)
     else:
-        run_nsga_eic(args, plot=True)
+        run_nsga_eic_problem(args, problem_name=str(getattr(args, "problem", "ZDT1")), plot=True)
 
 
 if __name__ == "__main__":
